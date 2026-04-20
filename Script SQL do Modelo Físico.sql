@@ -26,7 +26,7 @@ CREATE TABLE Endereco (
     CONSTRAINT CHK_CEP_len  CHECK (CHAR_LENGTH(CEP) = 8)
 );
  
---    Pix e boleto são processados na hora, só o cartão que entra no modelo?
+--    Pix e boleto são processados na hora, só o cartão que entra no modelo
 CREATE TABLE Dados_cobranca (
     Id_dados_cobranca   INT             NOT NULL AUTO_INCREMENT,
     Numero_cartao       VARCHAR(19)     NOT NULL,
