@@ -204,7 +204,7 @@ BEGIN
     CLOSE cur_datas;
 
     -- Registra rejeitos: snapshots sem SK correspondente nas dimensões
-    INSERT INTO staging.stg_rejeitos_ia
+    INSERT INTO staging.stg_rejeitos_gupessanha
         (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
     SELECT
         'stg_conf_snapshot_patio', s.nk_frota_origem, s.nk_id_veiculo,
@@ -302,7 +302,7 @@ BEGIN
     CLOSE cur_datas;
 
     -- Registra rejeitos: FKs que não resolvem para SK
-    INSERT INTO staging.stg_rejeitos_ia
+    INSERT INTO staging.stg_rejeitos_gupessanha
         (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
     SELECT
         'stg_conf_locacao', l.nk_frota_origem, l.nk_id_locacao,
@@ -429,7 +429,7 @@ BEGIN
     CLOSE cur_datas;
 
     -- Rejeitos
-    INSERT INTO staging.stg_rejeitos_ia
+    INSERT INTO staging.stg_rejeitos_gupessanha
         (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
     SELECT
         'stg_conf_reserva', r.nk_frota_origem, r.nk_id_reserva,
@@ -561,6 +561,6 @@ END;
   CALL dw.sp_gupessanha_carga_completa();
 
   -- Verificar rejeitos:
-  SELECT * FROM staging.vw_ia_qualidade_etl;
-  SELECT * FROM staging.stg_rejeitos_ia ORDER BY dt_rejeito DESC LIMIT 50;
+  SELECT * FROM staging.vw_gupessanha_qualidade_etl;
+  SELECT * FROM staging.stg_rejeitos_gupessanha ORDER BY dt_rejeito DESC LIMIT 50;
 */

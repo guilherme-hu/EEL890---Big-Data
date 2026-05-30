@@ -10,7 +10,7 @@
 --  1) TABELAS CONFORMADAS (criar se não existirem)
 
 -- Tabela de rejeitos — captura erros de qualidade para monitoramento e análise posterior
-CREATE TABLE IF NOT EXISTS staging.stg_rejeitos_ia (
+CREATE TABLE IF NOT EXISTS staging.stg_rejeitos_gupessanha (
     id_rejeito      INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
     tabela_origem   VARCHAR(50)  NOT NULL,
     nk_frota_origem VARCHAR(10),
@@ -170,7 +170,7 @@ BEGIN
     TRUNCATE TABLE staging.stg_conf_grupo;
 
     -- Registra rejeitos: grupos sem tarifa (qualidade de dados)
-    INSERT INTO staging.stg_rejeitos_ia
+    INSERT INTO staging.stg_rejeitos_gupessanha
         (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
     SELECT
         'stg_gupessanha_grupo', nk_frota_origem, nk_id_grupo,
@@ -212,7 +212,7 @@ BEGIN
     TRUNCATE TABLE staging.stg_conf_veiculo;
 
     -- Rejeita veículos sem grupo ou sem pátio (inconsistência de FK)
-    INSERT INTO staging.stg_rejeitos_ia
+    INSERT INTO staging.stg_rejeitos_gupessanha
         (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
     SELECT
         'stg_gupessanha_veiculo', nk_frota_origem, nk_id_veiculo,
@@ -278,7 +278,7 @@ BEGIN
     TRUNCATE TABLE staging.stg_conf_cliente;
 
     -- Rejeita clientes sem tipo definido
-    INSERT INTO staging.stg_rejeitos_ia
+    INSERT INTO staging.stg_rejeitos_gupessanha
         (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
     SELECT
         'stg_gupessanha_cliente', nk_frota_origem, nk_id_cliente,
@@ -334,7 +334,7 @@ BEGIN
     TRUNCATE TABLE staging.stg_conf_reserva;
 
     -- T9 + T10: rejeita reservas com datas inválidas ou FKs nulas
-    INSERT INTO staging.stg_rejeitos_ia
+    INSERT INTO staging.stg_rejeitos_gupessanha
         (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
     SELECT
         'stg_gupessanha_reserva',
@@ -449,7 +449,7 @@ BEGIN
     TRUNCATE TABLE staging.stg_conf_locacao;
 
     -- T9 + T10: rejeita locações com dados críticos ausentes/inválidos
-    INSERT INTO staging.stg_rejeitos_ia
+    INSERT INTO staging.stg_rejeitos_gupessanha
         (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
     SELECT
         'stg_gupessanha_locacao',
@@ -543,7 +543,7 @@ BEGIN
     TRUNCATE TABLE staging.stg_conf_snapshot_patio;
 
     -- Rejeita registros com NULLs em FKs
-    INSERT INTO staging.stg_rejeitos_ia
+    INSERT INTO staging.stg_rejeitos_gupessanha
         (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
     SELECT
         'stg_gupessanha_snapshot_patio', nk_frota_origem, nk_id_veiculo,
@@ -599,7 +599,7 @@ END;
 
 --  4) VIEW DE MONITORAMENTO DE QUALIDADE
 
-CREATE OR REPLACE VIEW staging.vw_ia_qualidade_etl AS
+CREATE OR REPLACE VIEW staging.vw_gupessanha_qualidade_etl AS
 SELECT
     tabela_origem,
     COUNT(*)                              AS total_rejeitos,
@@ -609,6 +609,6 @@ SELECT
     GROUP_CONCAT(DISTINCT motivo_rejeito
         ORDER BY motivo_rejeito
         SEPARATOR ' | ')                  AS motivos_distintos
-FROM staging.stg_rejeitos_ia
+FROM staging.stg_rejeitos_gupessanha
 GROUP BY tabela_origem
 ORDER BY total_rejeitos DESC;
