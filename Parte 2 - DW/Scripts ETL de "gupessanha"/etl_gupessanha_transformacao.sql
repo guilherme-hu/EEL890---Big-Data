@@ -10,7 +10,7 @@
 --  1) TABELAS CONFORMADAS (criar se não existirem)
 
 -- Tabela de rejeitos — captura erros de qualidade para monitoramento e análise posterior
-CREATE TABLE IF NOT EXISTS staging.stg_rejeitos_gupessanha (
+CREATE TABLE IF NOT EXISTS staging.stg_rejeitos_etl (
     id_rejeito      INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
     tabela_origem   VARCHAR(50)  NOT NULL,
     nk_frota_origem VARCHAR(10),
@@ -25,7 +25,9 @@ CREATE TABLE IF NOT EXISTS staging.stg_conf_patio (
     nk_id_patio           INT          NOT NULL,
     nome_patio            VARCHAR(100) NOT NULL,
     capacidade_vagas      INT          NOT NULL,  -- -1 se desconhecida
-    endereco              VARCHAR(200),            -- cidade + UF + logradouro
+    end_cidade            VARCHAR(100),
+    end_uf                VARCHAR(100),
+    end_pais              VARCHAR(100),
     PRIMARY KEY (nk_frota_origem, nk_id_patio)
 );
 
@@ -55,7 +57,9 @@ CREATE TABLE IF NOT EXISTS staging.stg_conf_cliente (
     nk_id_cliente         INT          NOT NULL,
     tipo_cliente          VARCHAR(2)   NOT NULL,  -- 'PF' ou 'PJ'
     nome                  VARCHAR(150) NOT NULL,
-    endereco              VARCHAR(200),            -- cidade + UF conformados
+    end_cidade            VARCHAR(100),
+    end_uf                VARCHAR(100),
+    end_pais              VARCHAR(100),
     PRIMARY KEY (nk_frota_origem, nk_id_cliente)
 );
 
@@ -133,7 +137,9 @@ BEGIN
         nk_id_patio,
         nome_patio,
         capacidade_vagas,
-        endereco
+        end_cidade,
+        end_uf,
+        end_pais
     )
     SELECT
         nk_frota_origem,
@@ -145,14 +151,10 @@ BEGIN
         )                                            AS nome_patio,
         -- T11: capacidade nula → sentinela -1
         COALESCE(capacidade_vagas, -1)               AS capacidade_vagas,
-        -- T2: monta endereço conformado; substitui NULLs
-        TRIM(CONCAT(
-            COALESCE(NULLIF(TRIM(end_logradouro), ''), 'NÃO INFORMADO'),
-            ', ',
-            COALESCE(NULLIF(TRIM(end_cidade), ''), 'NÃO INFORMADO'),
-            ' - ',
-            COALESCE(NULLIF(TRIM(end_uf), ''), 'XX')
-        ))                                           AS endereco
+        -- T2: monta endereço desmembrado
+        COALESCE(NULLIF(TRIM(end_cidade), ''), 'NÃO INFORMADO') AS end_cidade,
+        COALESCE(NULLIF(TRIM(end_uf), ''), 'XX')                AS end_uf,
+        'Brasil'                                                AS end_pais
     FROM staging.stg_gupessanha_patio
     WHERE nk_frota_origem = 'gupessanha';
 
@@ -170,7 +172,7 @@ BEGIN
     TRUNCATE TABLE staging.stg_conf_grupo;
 
     -- Registra rejeitos: grupos sem tarifa (qualidade de dados)
-    INSERT INTO staging.stg_rejeitos_gupessanha
+    INSERT INTO staging.stg_rejeitos_etl
         (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
     SELECT
         'stg_gupessanha_grupo', nk_frota_origem, nk_id_grupo,
@@ -212,7 +214,7 @@ BEGIN
     TRUNCATE TABLE staging.stg_conf_veiculo;
 
     -- Rejeita veículos sem grupo ou sem pátio (inconsistência de FK)
-    INSERT INTO staging.stg_rejeitos_gupessanha
+    INSERT INTO staging.stg_rejeitos_etl
         (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
     SELECT
         'stg_gupessanha_veiculo', nk_frota_origem, nk_id_veiculo,
@@ -278,7 +280,7 @@ BEGIN
     TRUNCATE TABLE staging.stg_conf_cliente;
 
     -- Rejeita clientes sem tipo definido
-    INSERT INTO staging.stg_rejeitos_gupessanha
+    INSERT INTO staging.stg_rejeitos_etl
         (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
     SELECT
         'stg_gupessanha_cliente', nk_frota_origem, nk_id_cliente,
@@ -294,7 +296,9 @@ BEGIN
         nk_id_cliente,
         tipo_cliente,
         nome,
-        endereco
+        end_cidade,
+        end_uf,
+        end_pais
     )
     SELECT
         nk_frota_origem,
@@ -306,12 +310,10 @@ BEGIN
             UPPER(LEFT(TRIM(COALESCE(nome, 'NÃO IDENTIFICADO')), 1)),
             LOWER(SUBSTRING(TRIM(COALESCE(nome, 'NÃO IDENTIFICADO')), 2))
         )                                        AS nome,
-        -- T2: endereço conformado
-        TRIM(CONCAT(
-            COALESCE(NULLIF(TRIM(end_cidade), ''), 'NÃO INFORMADO'),
-            ' - ',
-            COALESCE(NULLIF(TRIM(end_uf), ''), 'XX')
-        ))                                       AS endereco
+        -- T2: endereço conformado desmembrado
+        COALESCE(NULLIF(TRIM(end_cidade), ''), 'NÃO INFORMADO') AS end_cidade,
+        COALESCE(NULLIF(TRIM(end_uf), ''), 'XX')                AS end_uf,
+        'Brasil'                                                AS end_pais
     FROM staging.stg_gupessanha_cliente
     WHERE nk_frota_origem = 'gupessanha'
       AND tipo_cliente IN ('PF', 'PJ');
@@ -334,7 +336,7 @@ BEGIN
     TRUNCATE TABLE staging.stg_conf_reserva;
 
     -- T9 + T10: rejeita reservas com datas inválidas ou FKs nulas
-    INSERT INTO staging.stg_rejeitos_gupessanha
+    INSERT INTO staging.stg_rejeitos_etl
         (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
     SELECT
         'stg_gupessanha_reserva',
@@ -407,9 +409,8 @@ BEGIN
         s.data_devolucao_prevista,
         -- T7: duração recalculada para segurança
         DATEDIFF(s.data_devolucao_prevista, s.data_retirada_prevista) AS duracao_prevista_dias,
-        -- T8: valor previsto = duração × diária do grupo conformado
-        DATEDIFF(s.data_devolucao_prevista, s.data_retirada_prevista)
-            * COALESCE(g.valor_diaria, 0)                             AS valor_previsto_reserva,
+        -- T8: valor previsto mantido do OLTP (preserva descontos e negociações)
+        COALESCE(s.valor_previsto_reserva, 0)                         AS valor_previsto_reserva,
         -- T6: status mapeado já vem do staging; confirmamos aqui
         CASE UPPER(TRIM(COALESCE(s.status_reserva, '')))
             WHEN 'ATIVA'      THEN 'ATIVA'
@@ -449,7 +450,7 @@ BEGIN
     TRUNCATE TABLE staging.stg_conf_locacao;
 
     -- T9 + T10: rejeita locações com dados críticos ausentes/inválidos
-    INSERT INTO staging.stg_rejeitos_gupessanha
+    INSERT INTO staging.stg_rejeitos_etl
         (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
     SELECT
         'stg_gupessanha_locacao',
@@ -543,7 +544,7 @@ BEGIN
     TRUNCATE TABLE staging.stg_conf_snapshot_patio;
 
     -- Rejeita registros com NULLs em FKs
-    INSERT INTO staging.stg_rejeitos_gupessanha
+    INSERT INTO staging.stg_rejeitos_etl
         (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
     SELECT
         'stg_gupessanha_snapshot_patio', nk_frota_origem, nk_id_veiculo,
@@ -605,10 +606,270 @@ SELECT
     COUNT(*)                              AS total_rejeitos,
     MIN(dt_rejeito)                       AS primeiro_rejeito,
     MAX(dt_rejeito)                       AS ultimo_rejeito,
-    -- Em MySQL, STRING_AGG não existe; GROUP_CONCAT com DISTINCT e ORDER BY é o equivalente.
     GROUP_CONCAT(DISTINCT motivo_rejeito
         ORDER BY motivo_rejeito
         SEPARATOR ' | ')                  AS motivos_distintos
-FROM staging.stg_rejeitos_gupessanha
+FROM staging.stg_rejeitos_etl
 GROUP BY tabela_origem
 ORDER BY total_rejeitos DESC;
+
+
+-- =========================================================================
+--  5) TRIGGERS DE TRANSFORMAÇÃO (Event-Driven)
+--     Substituem as procedures de transformação para operação em tempo real.
+--     Cada INSERT/UPDATE no staging bruto (stg_gupessanha_*) dispara a
+--     transformação e grava no staging conformado (stg_conf_*).
+-- =========================================================================
+
+DELIMITER //
+
+-- 5.1) Patio
+DROP TRIGGER IF EXISTS staging.trg_transforma_gupessanha_patio_ai//
+CREATE TRIGGER staging.trg_transforma_gupessanha_patio_ai
+AFTER INSERT ON staging.stg_gupessanha_patio
+FOR EACH ROW
+BEGIN
+    INSERT INTO staging.stg_conf_patio (
+        nk_frota_origem, nk_id_patio, nome_patio, capacidade_vagas,
+        end_cidade, end_uf, end_pais
+    ) VALUES (
+        NEW.nk_frota_origem, NEW.nk_id_patio,
+        CONCAT(UPPER(LEFT(TRIM(NEW.nome_patio), 1)), LOWER(SUBSTRING(TRIM(NEW.nome_patio), 2))),
+        COALESCE(NEW.capacidade_vagas, -1),
+        COALESCE(NULLIF(TRIM(NEW.end_cidade), ''), 'NÃO INFORMADO'),
+        COALESCE(NULLIF(TRIM(NEW.end_uf), ''), 'XX'), 'Brasil'
+    ) ON DUPLICATE KEY UPDATE
+        nome_patio = VALUES(nome_patio), capacidade_vagas = VALUES(capacidade_vagas),
+        end_cidade = VALUES(end_cidade), end_uf = VALUES(end_uf);
+END//
+
+DROP TRIGGER IF EXISTS staging.trg_transforma_gupessanha_patio_au//
+CREATE TRIGGER staging.trg_transforma_gupessanha_patio_au
+AFTER UPDATE ON staging.stg_gupessanha_patio
+FOR EACH ROW
+BEGIN
+    INSERT INTO staging.stg_conf_patio (
+        nk_frota_origem, nk_id_patio, nome_patio, capacidade_vagas,
+        end_cidade, end_uf, end_pais
+    ) VALUES (
+        NEW.nk_frota_origem, NEW.nk_id_patio,
+        CONCAT(UPPER(LEFT(TRIM(NEW.nome_patio), 1)), LOWER(SUBSTRING(TRIM(NEW.nome_patio), 2))),
+        COALESCE(NEW.capacidade_vagas, -1),
+        COALESCE(NULLIF(TRIM(NEW.end_cidade), ''), 'NÃO INFORMADO'),
+        COALESCE(NULLIF(TRIM(NEW.end_uf), ''), 'XX'), 'Brasil'
+    ) ON DUPLICATE KEY UPDATE
+        nome_patio = VALUES(nome_patio), capacidade_vagas = VALUES(capacidade_vagas),
+        end_cidade = VALUES(end_cidade), end_uf = VALUES(end_uf);
+END//
+
+-- 5.2) Grupo
+DROP TRIGGER IF EXISTS staging.trg_transforma_gupessanha_grupo_ai//
+CREATE TRIGGER staging.trg_transforma_gupessanha_grupo_ai
+AFTER INSERT ON staging.stg_gupessanha_grupo
+FOR EACH ROW
+BEGIN
+    IF NEW.valor_diaria IS NULL OR NEW.valor_diaria = 0 THEN
+        INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+        VALUES ('stg_gupessanha_grupo', NEW.nk_frota_origem, NEW.nk_id_grupo, 'Grupo sem valor_diaria vigente; será carregado com valor 0,00');
+    END IF;
+
+    INSERT INTO staging.stg_conf_grupo (
+        nk_frota_origem, nk_id_grupo, nome_grupo, valor_diaria
+    ) VALUES (
+        NEW.nk_frota_origem, NEW.nk_id_grupo,
+        CONCAT(UPPER(LEFT(TRIM(COALESCE(NEW.nome_grupo, NEW.codigo_grupo, CONCAT('GRUPO ', NEW.nk_id_grupo))), 1)), LOWER(SUBSTRING(TRIM(COALESCE(NEW.nome_grupo, NEW.codigo_grupo, CONCAT('GRUPO ', NEW.nk_id_grupo))), 2))),
+        COALESCE(NEW.valor_diaria, 0)
+    ) ON DUPLICATE KEY UPDATE
+        nome_grupo = VALUES(nome_grupo), valor_diaria = VALUES(valor_diaria);
+END//
+
+DROP TRIGGER IF EXISTS staging.trg_transforma_gupessanha_grupo_au//
+CREATE TRIGGER staging.trg_transforma_gupessanha_grupo_au
+AFTER UPDATE ON staging.stg_gupessanha_grupo
+FOR EACH ROW
+BEGIN
+    INSERT INTO staging.stg_conf_grupo (
+        nk_frota_origem, nk_id_grupo, nome_grupo, valor_diaria
+    ) VALUES (
+        NEW.nk_frota_origem, NEW.nk_id_grupo,
+        CONCAT(UPPER(LEFT(TRIM(COALESCE(NEW.nome_grupo, NEW.codigo_grupo, CONCAT('GRUPO ', NEW.nk_id_grupo))), 1)), LOWER(SUBSTRING(TRIM(COALESCE(NEW.nome_grupo, NEW.codigo_grupo, CONCAT('GRUPO ', NEW.nk_id_grupo))), 2))),
+        COALESCE(NEW.valor_diaria, 0)
+    ) ON DUPLICATE KEY UPDATE
+        nome_grupo = VALUES(nome_grupo), valor_diaria = VALUES(valor_diaria);
+END//
+
+-- 5.3) Veiculo
+DROP TRIGGER IF EXISTS staging.trg_transforma_gupessanha_veiculo_ai//
+CREATE TRIGGER staging.trg_transforma_gupessanha_veiculo_ai
+AFTER INSERT ON staging.stg_gupessanha_veiculo
+FOR EACH ROW
+BEGIN
+    IF NEW.nk_id_grupo IS NULL OR NEW.nk_id_patio_origem IS NULL THEN
+        INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+        VALUES ('stg_gupessanha_veiculo', NEW.nk_frota_origem, NEW.nk_id_veiculo, 'Veículo sem nk_id_grupo ou sem nk_id_patio_origem');
+    ELSE
+        INSERT INTO staging.stg_conf_veiculo (
+            nk_frota_origem, nk_id_veiculo, nk_id_grupo, nk_id_patio_origem,
+            placa, marca, modelo, mecanizacao, tem_ar_condicionado
+        ) VALUES (
+            NEW.nk_frota_origem, NEW.nk_id_veiculo, NEW.nk_id_grupo, NEW.nk_id_patio_origem,
+            UPPER(TRIM(NEW.placa)),
+            CONCAT(UPPER(LEFT(TRIM(COALESCE(NEW.marca, 'NÃO INFORMADO')), 1)), LOWER(SUBSTRING(TRIM(COALESCE(NEW.marca, 'NÃO INFORMADO')), 2))),
+            CONCAT(UPPER(LEFT(TRIM(COALESCE(NEW.modelo, 'NÃO INFORMADO')), 1)), LOWER(SUBSTRING(TRIM(COALESCE(NEW.modelo, 'NÃO INFORMADO')), 2))),
+            CASE UPPER(TRIM(COALESCE(NEW.mecanizacao, ''))) WHEN 'MANUAL' THEN 'MANUAL' WHEN 'AUTOMATICA' THEN 'AUTOMATICO' WHEN 'AUTOMATICO' THEN 'AUTOMATICO' ELSE 'NÃO INFORMADO' END,
+            COALESCE(NEW.tem_ar_condicionado, FALSE)
+        ) ON DUPLICATE KEY UPDATE
+            nk_id_grupo = VALUES(nk_id_grupo), nk_id_patio_origem = VALUES(nk_id_patio_origem),
+            placa = VALUES(placa), marca = VALUES(marca), modelo = VALUES(modelo),
+            mecanizacao = VALUES(mecanizacao), tem_ar_condicionado = VALUES(tem_ar_condicionado);
+    END IF;
+END//
+
+DROP TRIGGER IF EXISTS staging.trg_transforma_gupessanha_veiculo_au//
+CREATE TRIGGER staging.trg_transforma_gupessanha_veiculo_au
+AFTER UPDATE ON staging.stg_gupessanha_veiculo
+FOR EACH ROW
+BEGIN
+    IF NEW.nk_id_grupo IS NOT NULL AND NEW.nk_id_patio_origem IS NOT NULL THEN
+        INSERT INTO staging.stg_conf_veiculo (
+            nk_frota_origem, nk_id_veiculo, nk_id_grupo, nk_id_patio_origem,
+            placa, marca, modelo, mecanizacao, tem_ar_condicionado
+        ) VALUES (
+            NEW.nk_frota_origem, NEW.nk_id_veiculo, NEW.nk_id_grupo, NEW.nk_id_patio_origem,
+            UPPER(TRIM(NEW.placa)),
+            CONCAT(UPPER(LEFT(TRIM(COALESCE(NEW.marca, 'NÃO INFORMADO')), 1)), LOWER(SUBSTRING(TRIM(COALESCE(NEW.marca, 'NÃO INFORMADO')), 2))),
+            CONCAT(UPPER(LEFT(TRIM(COALESCE(NEW.modelo, 'NÃO INFORMADO')), 1)), LOWER(SUBSTRING(TRIM(COALESCE(NEW.modelo, 'NÃO INFORMADO')), 2))),
+            CASE UPPER(TRIM(COALESCE(NEW.mecanizacao, ''))) WHEN 'MANUAL' THEN 'MANUAL' WHEN 'AUTOMATICA' THEN 'AUTOMATICO' WHEN 'AUTOMATICO' THEN 'AUTOMATICO' ELSE 'NÃO INFORMADO' END,
+            COALESCE(NEW.tem_ar_condicionado, FALSE)
+        ) ON DUPLICATE KEY UPDATE
+            nk_id_grupo = VALUES(nk_id_grupo), nk_id_patio_origem = VALUES(nk_id_patio_origem),
+            placa = VALUES(placa), marca = VALUES(marca), modelo = VALUES(modelo),
+            mecanizacao = VALUES(mecanizacao), tem_ar_condicionado = VALUES(tem_ar_condicionado);
+    END IF;
+END//
+
+-- 5.4) Cliente
+DROP TRIGGER IF EXISTS staging.trg_transforma_gupessanha_cliente_ai//
+CREATE TRIGGER staging.trg_transforma_gupessanha_cliente_ai
+AFTER INSERT ON staging.stg_gupessanha_cliente
+FOR EACH ROW
+BEGIN
+    IF NEW.tipo_cliente NOT IN ('PF', 'PJ') THEN
+        INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+        VALUES ('stg_gupessanha_cliente', NEW.nk_frota_origem, NEW.nk_id_cliente, 'Cliente sem tipo_cliente (PF/PJ)');
+    ELSE
+        INSERT INTO staging.stg_conf_cliente (
+            nk_frota_origem, nk_id_cliente, tipo_cliente, nome, end_cidade, end_uf, end_pais
+        ) VALUES (
+            NEW.nk_frota_origem, NEW.nk_id_cliente, UPPER(TRIM(NEW.tipo_cliente)),
+            CONCAT(UPPER(LEFT(TRIM(COALESCE(NEW.nome, 'NÃO IDENTIFICADO')), 1)), LOWER(SUBSTRING(TRIM(COALESCE(NEW.nome, 'NÃO IDENTIFICADO')), 2))),
+            COALESCE(NULLIF(TRIM(NEW.end_cidade), ''), 'NÃO INFORMADO'),
+            COALESCE(NULLIF(TRIM(NEW.end_uf), ''), 'XX'), 'Brasil'
+        ) ON DUPLICATE KEY UPDATE
+            tipo_cliente = VALUES(tipo_cliente), nome = VALUES(nome),
+            end_cidade = VALUES(end_cidade), end_uf = VALUES(end_uf);
+    END IF;
+END//
+
+DROP TRIGGER IF EXISTS staging.trg_transforma_gupessanha_cliente_au//
+CREATE TRIGGER staging.trg_transforma_gupessanha_cliente_au
+AFTER UPDATE ON staging.stg_gupessanha_cliente
+FOR EACH ROW
+BEGIN
+    IF NEW.tipo_cliente IN ('PF', 'PJ') THEN
+        INSERT INTO staging.stg_conf_cliente (
+            nk_frota_origem, nk_id_cliente, tipo_cliente, nome, end_cidade, end_uf, end_pais
+        ) VALUES (
+            NEW.nk_frota_origem, NEW.nk_id_cliente, UPPER(TRIM(NEW.tipo_cliente)),
+            CONCAT(UPPER(LEFT(TRIM(COALESCE(NEW.nome, 'NÃO IDENTIFICADO')), 1)), LOWER(SUBSTRING(TRIM(COALESCE(NEW.nome, 'NÃO IDENTIFICADO')), 2))),
+            COALESCE(NULLIF(TRIM(NEW.end_cidade), ''), 'NÃO INFORMADO'),
+            COALESCE(NULLIF(TRIM(NEW.end_uf), ''), 'XX'), 'Brasil'
+        ) ON DUPLICATE KEY UPDATE
+            tipo_cliente = VALUES(tipo_cliente), nome = VALUES(nome),
+            end_cidade = VALUES(end_cidade), end_uf = VALUES(end_uf);
+    END IF;
+END//
+
+-- 5.5) Reserva
+DROP TRIGGER IF EXISTS staging.trg_transforma_gupessanha_reserva_ai//
+CREATE TRIGGER staging.trg_transforma_gupessanha_reserva_ai
+AFTER INSERT ON staging.stg_gupessanha_reserva
+FOR EACH ROW
+BEGIN
+    IF NEW.nk_id_cliente IS NULL OR NEW.nk_id_grupo IS NULL OR NEW.nk_id_patio_retirada IS NULL OR NEW.nk_id_patio_fim IS NULL OR NEW.data_reserva IS NULL OR NEW.data_retirada_prevista IS NULL OR NEW.data_devolucao_prevista IS NULL OR NEW.data_devolucao_prevista <= NEW.data_retirada_prevista OR COALESCE(NEW.duracao_prevista_dias, 0) < 1 THEN
+        INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+        VALUES ('stg_gupessanha_reserva', NEW.nk_frota_origem, NEW.nk_id_reserva, 'Reserva inválida');
+    ELSE
+        INSERT INTO staging.stg_conf_reserva (
+            nk_frota_origem, nk_id_reserva, nk_id_cliente, nk_id_grupo, nk_id_patio_retirada, nk_id_patio_fim,
+            data_reserva, data_retirada_prevista, data_devolucao_prevista, duracao_prevista_dias, valor_previsto_reserva, status_reserva
+        ) VALUES (
+            NEW.nk_frota_origem, NEW.nk_id_reserva, NEW.nk_id_cliente, NEW.nk_id_grupo, NEW.nk_id_patio_retirada, NEW.nk_id_patio_fim,
+            NEW.data_reserva, NEW.data_retirada_prevista, NEW.data_devolucao_prevista,
+            DATEDIFF(NEW.data_devolucao_prevista, NEW.data_retirada_prevista),
+            COALESCE(NEW.valor_previsto_reserva, 0),
+            CASE UPPER(TRIM(COALESCE(NEW.status_reserva, ''))) WHEN 'ATIVA' THEN 'ATIVA' WHEN 'CANCELADA' THEN 'CANCELADA' WHEN 'CONVERTIDA' THEN 'CONVERTIDA' ELSE 'ATIVA' END
+        ) ON DUPLICATE KEY UPDATE
+            status_reserva = VALUES(status_reserva), valor_previsto_reserva = VALUES(valor_previsto_reserva);
+    END IF;
+END//
+
+DROP TRIGGER IF EXISTS staging.trg_transforma_gupessanha_reserva_au//
+CREATE TRIGGER staging.trg_transforma_gupessanha_reserva_au
+AFTER UPDATE ON staging.stg_gupessanha_reserva
+FOR EACH ROW
+BEGIN
+    IF NEW.nk_id_cliente IS NOT NULL AND NEW.nk_id_grupo IS NOT NULL AND NEW.nk_id_patio_retirada IS NOT NULL AND NEW.nk_id_patio_fim IS NOT NULL AND NEW.data_reserva IS NOT NULL AND NEW.data_retirada_prevista IS NOT NULL AND NEW.data_devolucao_prevista IS NOT NULL AND NEW.data_devolucao_prevista > NEW.data_retirada_prevista AND COALESCE(NEW.duracao_prevista_dias, 0) >= 1 THEN
+        INSERT INTO staging.stg_conf_reserva (
+            nk_frota_origem, nk_id_reserva, nk_id_cliente, nk_id_grupo, nk_id_patio_retirada, nk_id_patio_fim,
+            data_reserva, data_retirada_prevista, data_devolucao_prevista, duracao_prevista_dias, valor_previsto_reserva, status_reserva
+        ) VALUES (
+            NEW.nk_frota_origem, NEW.nk_id_reserva, NEW.nk_id_cliente, NEW.nk_id_grupo, NEW.nk_id_patio_retirada, NEW.nk_id_patio_fim,
+            NEW.data_reserva, NEW.data_retirada_prevista, NEW.data_devolucao_prevista,
+            DATEDIFF(NEW.data_devolucao_prevista, NEW.data_retirada_prevista),
+            COALESCE(NEW.valor_previsto_reserva, 0),
+            CASE UPPER(TRIM(COALESCE(NEW.status_reserva, ''))) WHEN 'ATIVA' THEN 'ATIVA' WHEN 'CANCELADA' THEN 'CANCELADA' WHEN 'CONVERTIDA' THEN 'CONVERTIDA' ELSE 'ATIVA' END
+        ) ON DUPLICATE KEY UPDATE
+            status_reserva = VALUES(status_reserva), valor_previsto_reserva = VALUES(valor_previsto_reserva);
+    END IF;
+END//
+
+-- 5.6) Locação
+DROP TRIGGER IF EXISTS staging.trg_transforma_gupessanha_locacao_ai//
+CREATE TRIGGER staging.trg_transforma_gupessanha_locacao_ai
+AFTER INSERT ON staging.stg_gupessanha_locacao
+FOR EACH ROW
+BEGIN
+    IF NEW.nk_id_cliente IS NULL OR NEW.nk_id_veiculo IS NULL OR NEW.nk_id_grupo IS NULL OR NEW.nk_id_patio_retirada IS NULL OR NEW.data_retirada IS NULL OR NEW.data_prev_devolucao IS NULL OR (NEW.data_real_devolucao IS NOT NULL AND NEW.data_real_devolucao < NEW.data_retirada) THEN
+        INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+        VALUES ('stg_gupessanha_locacao', NEW.nk_frota_origem, NEW.nk_id_locacao, 'Locação inválida');
+    ELSE
+        INSERT INTO staging.stg_conf_locacao (
+            nk_frota_origem, nk_id_locacao, nk_id_cliente, nk_id_veiculo, nk_id_grupo, nk_id_patio_retirada, nk_id_patio_devolucao,
+            data_retirada, data_prev_devolucao, data_real_devolucao, valor_final
+        ) VALUES (
+            NEW.nk_frota_origem, NEW.nk_id_locacao, NEW.nk_id_cliente, NEW.nk_id_veiculo, NEW.nk_id_grupo, NEW.nk_id_patio_retirada, NEW.nk_id_patio_devolucao,
+            NEW.data_retirada, NEW.data_prev_devolucao, NEW.data_real_devolucao, GREATEST(COALESCE(NEW.valor_final, 0), 0)
+        ) ON DUPLICATE KEY UPDATE
+            nk_id_patio_devolucao = VALUES(nk_id_patio_devolucao), data_real_devolucao = VALUES(data_real_devolucao), valor_final = VALUES(valor_final);
+    END IF;
+END//
+
+DROP TRIGGER IF EXISTS staging.trg_transforma_gupessanha_locacao_au//
+CREATE TRIGGER staging.trg_transforma_gupessanha_locacao_au
+AFTER UPDATE ON staging.stg_gupessanha_locacao
+FOR EACH ROW
+BEGIN
+    IF NEW.nk_id_cliente IS NOT NULL AND NEW.nk_id_veiculo IS NOT NULL AND NEW.nk_id_grupo IS NOT NULL AND NEW.nk_id_patio_retirada IS NOT NULL AND NEW.data_retirada IS NOT NULL AND NEW.data_prev_devolucao IS NOT NULL AND (NEW.data_real_devolucao IS NULL OR NEW.data_real_devolucao >= NEW.data_retirada) THEN
+        INSERT INTO staging.stg_conf_locacao (
+            nk_frota_origem, nk_id_locacao, nk_id_cliente, nk_id_veiculo, nk_id_grupo, nk_id_patio_retirada, nk_id_patio_devolucao,
+            data_retirada, data_prev_devolucao, data_real_devolucao, valor_final
+        ) VALUES (
+            NEW.nk_frota_origem, NEW.nk_id_locacao, NEW.nk_id_cliente, NEW.nk_id_veiculo, NEW.nk_id_grupo, NEW.nk_id_patio_retirada, NEW.nk_id_patio_devolucao,
+            NEW.data_retirada, NEW.data_prev_devolucao, NEW.data_real_devolucao, GREATEST(COALESCE(NEW.valor_final, 0), 0)
+        ) ON DUPLICATE KEY UPDATE
+            nk_id_patio_devolucao = VALUES(nk_id_patio_devolucao), data_real_devolucao = VALUES(data_real_devolucao), valor_final = VALUES(valor_final);
+    END IF;
+END//
+
+DELIMITER ;
