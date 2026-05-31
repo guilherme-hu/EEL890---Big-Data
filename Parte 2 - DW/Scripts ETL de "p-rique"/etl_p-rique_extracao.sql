@@ -5,379 +5,521 @@
 -- Guilherme En Shih Hu (123224674)
 -- Maria Victoria França Silva Ramos (123311073)
 
+
 -- =============================================================================
--- 01_amarelo_extract.sql
--- Extração ETL — Amarelo OLTP → Área de Staging
+-- etl_p-rique_extracao.sql
+-- Extração ETL — OLTP Amarelo (locadora_amarelo) → Área de Staging
 --
--- Frota de origem : 'AMARELO'
--- Banco fonte     : locadora_amarelo (deploy do script script-modelagem.sql)
---                   *** ATENÇÃO: o grupo Amarelo nomeou seu banco 'locadora_dw'
---                   em seu DDL original. Ao implantar em ambiente de integração,
---                   o banco deve ser renomeado/reconfigurado para 'locadora_amarelo'
---                   para evitar conflito com outros sistemas. ***
--- Banco staging   : staging_dw
+-- Frota de origem : 'p-rique'
+-- Banco fonte     : locadora_amarelo
+-- Banco staging   : staging  (mesmo schema usado pelo gupessanha)
 --
--- Periodicidade de acionamento (conforme modelo DW):
---   • Dimensões (endereço, cliente, veículo, grupo, pátio)
---       → Full extract diário: 00:00 ou janela de baixo tráfego
---   • Fato Reserva
---       → Full extract diário (status muda ao longo do dia): 23:00
---   • Fato Locação
---       → Full extract diário (inclui locações em aberto e concluídas): 23:00
---   • Inventário de Pátio (snapshot)
---       → Diário ao final do expediente: 23:59
---
--- Premissas:
---   • Todas as tabelas de staging são truncadas antes de cada carga full.
+-- Estratégia de extração:
+--   • Todas as entidades usam carga full (TRUNCATE + INSERT), pois o OLTP
+--     Amarelo não possui colunas de controle de alteração (updated_at).
 --   • Os campos dt_extracao registram o momento da execução para auditoria.
---   • O campo frota_origem = 'AMARELO' é adicionado em todas as tabelas.
+--   • O campo nk_frota_origem = 'p-rique' identifica esta fonte no DW.
+--
+-- Mapeamento OLTP Amarelo → conceitos do DW:
+--   Categoria  → Grupo
+--   Vaga/Patio → localização física do veículo
+--   Endereco   → desnormalizado em staging (cidade, UF, logradouro)
 -- =============================================================================
 
-CREATE DATABASE IF NOT EXISTS staging_dw
-    CHARACTER SET utf8mb4
-    COLLATE utf8mb4_unicode_ci;
 
-USE staging_dw;
-
--- =============================================================================
--- PARTE 1 — CRIAÇÃO DAS TABELAS DE STAGING (executado uma única vez)
--- =============================================================================
-
--- ---------------------------------------------------------------------------
--- STG_AMAR_ENDERECO
--- Espelha locadora_amarelo.Endereco com metadados de extração.
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS stg_amar_endereco (
-    id_endereco     INT             NOT NULL,
-    uf              CHAR(2)         NULL,
-    cep             VARCHAR(8)      NULL,
-    cidade          VARCHAR(100)    NULL,
-    bairro          VARCHAR(100)    NULL,
-    logradouro      VARCHAR(150)    NULL,
-    numero          VARCHAR(20)     NULL,
-    complemento     VARCHAR(100)    NULL,
-    dt_extracao     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT PK_stg_amar_endereco PRIMARY KEY (id_endereco)
-) COMMENT = 'Staging: endereços extraídos do OLTP Amarelo';
-
--- ---------------------------------------------------------------------------
--- STG_AMAR_CLIENTE
--- Consolida herança PF/PJ em linha única. Campos exclusivos de PF e PJ
--- ficam NULL quando não aplicáveis.
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS stg_amar_cliente (
-    id_cliente              INT             NOT NULL,
-    id_endereco             INT             NULL,
-    tipo_cliente            CHAR(2)         NULL     COMMENT 'PF ou PJ',
-    email_cliente           VARCHAR(100)    NULL,
-    telefone_cliente        VARCHAR(20)     NULL,
-    -- Atributos exclusivos de PF (null quando PJ)
-    nome_pf                 VARCHAR(100)    NULL,
-    cpf_cliente             VARCHAR(11)     NULL,
-    data_nascimento         DATE            NULL,
-    -- Atributos exclusivos de PJ (null quando PF)
-    razao_social            VARCHAR(100)    NULL,
-    nome_fantasia           VARCHAR(100)    NULL,
-    cnpj_cliente            VARCHAR(14)     NULL,
-    dt_extracao             DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT PK_stg_amar_cliente PRIMARY KEY (id_cliente)
-) COMMENT = 'Staging: clientes PF+PJ extraídos do OLTP Amarelo';
-
--- ---------------------------------------------------------------------------
--- STG_AMAR_VEICULO
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS stg_amar_veiculo (
-    id_veiculo              INT             NOT NULL,
-    id_empresa              INT             NULL,
-    id_categoria            INT             NULL,
-    id_vaga                 INT             NULL COMMENT 'NULL = veículo locado/fora do pátio',
-    placa                   VARCHAR(7)      NULL,
-    chassi                  VARCHAR(17)     NULL,
-    marca                   VARCHAR(50)     NULL,
-    modelo                  VARCHAR(50)     NULL,
-    ano                     INT             NULL,
-    tipo_cambio             VARCHAR(20)     NULL,
-    possui_ar_condicionado  TINYINT(1)      NULL,
-    status_veiculo          VARCHAR(30)     NULL,
-    dt_extracao             DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT PK_stg_amar_veiculo PRIMARY KEY (id_veiculo)
-) COMMENT = 'Staging: frota de veículos extraída do OLTP Amarelo';
-
--- ---------------------------------------------------------------------------
--- STG_AMAR_CATEGORIA
--- "Categoria" no OLTP Amarelo corresponde a "Grupo" no modelo DW.
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS stg_amar_categoria (
-    id_categoria        INT             NOT NULL,
-    nome_categoria      VARCHAR(50)     NULL,
-    descricao_categoria TEXT            NULL,
-    valor_diaria_base   DECIMAL(10,2)   NULL,
-    dt_extracao         DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT PK_stg_amar_categoria PRIMARY KEY (id_categoria)
-) COMMENT = 'Staging: categorias (grupos) extraídas do OLTP Amarelo';
-
--- ---------------------------------------------------------------------------
--- STG_AMAR_PATIO
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS stg_amar_patio (
-    id_patio        INT             NOT NULL,
-    id_empresa      INT             NULL,
-    id_endereco     INT             NULL,
-    nome_patio      VARCHAR(100)    NULL,
-    capacidade      INT             NULL,
-    dt_extracao     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT PK_stg_amar_patio PRIMARY KEY (id_patio)
-) COMMENT = 'Staging: pátios extraídos do OLTP Amarelo';
-
--- ---------------------------------------------------------------------------
--- STG_AMAR_RESERVA
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS stg_amar_reserva (
-    id_reserva                      INT             NOT NULL,
-    id_cliente                      INT             NULL,
-    id_categoria                    INT             NULL,
-    id_patio_previsto_retirada      INT             NULL,
-    id_patio_previsto_devolucao     INT             NULL,
-    data_hora_reserva               DATETIME        NULL,
-    data_previsao_retirada          DATETIME        NULL,
-    data_previsao_devolucao         DATETIME        NULL,
-    valor_previsto                  DECIMAL(10,2)   NULL,
-    status_reserva                  VARCHAR(30)     NULL,
-    dt_extracao                     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT PK_stg_amar_reserva PRIMARY KEY (id_reserva)
-) COMMENT = 'Staging: reservas extraídas do OLTP Amarelo';
-
--- ---------------------------------------------------------------------------
--- STG_AMAR_LOCACAO
--- Enriquecida durante a extração com id_cliente (via Reserva)
--- e id_categoria (via Veiculo), evitando joins desnecessários na carga.
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS stg_amar_locacao (
-    id_locacao                  INT             NOT NULL,
-    id_reserva                  INT             NULL,
-    id_veiculo                  INT             NULL,
-    id_cliente                  INT             NULL COMMENT 'Recuperado via Reserva',
-    id_categoria                INT             NULL COMMENT 'Recuperado via Veiculo',
-    id_patio_real_retirada      INT             NULL,
-    id_patio_real_devolucao     INT             NULL,
-    data_hora_retirada_real     DATETIME        NULL,
-    data_hora_devolucao_real    DATETIME        NULL COMMENT 'NULL enquanto locação em aberto',
-    data_previsao_devolucao     DATETIME        NULL COMMENT 'Recuperado via Reserva',
-    km_retirada                 INT             NULL,
-    km_devolucao                INT             NULL,
-    valor_total_final           DECIMAL(10,2)   NULL COMMENT 'NULL enquanto locação em aberto',
-    status_locacao              VARCHAR(30)     NULL,
-    dt_extracao                 DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT PK_stg_amar_locacao PRIMARY KEY (id_locacao)
-) COMMENT = 'Staging: locações extraídas do OLTP Amarelo';
-
--- ---------------------------------------------------------------------------
--- STG_AMAR_INVENTARIO_PATIO
--- Snapshot diário: veículos presentes fisicamente em cada pátio.
--- Um veículo está no pátio quando seu campo Id_vaga IS NOT NULL.
--- Chave: (id_veiculo, dt_snapshot) — permite histórico de snapshots.
--- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS stg_amar_inventario_patio (
-    id_veiculo      INT     NOT NULL,
-    id_patio        INT     NOT NULL,
-    id_categoria    INT     NULL,
-    dt_snapshot     DATE    NOT NULL COMMENT 'Data do snapshot diário',
-    dt_extracao     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT PK_stg_amar_inventario PRIMARY KEY (id_veiculo, dt_snapshot)
-) COMMENT = 'Staging: snapshot diário de veículos em pátio — OLTP Amarelo';
+-- Marca o momento desta extração para uso nos metadados
+SET @extracao_ts = NOW();
 
 
--- =============================================================================
--- PARTE 2 — EXTRAÇÃO: CARGA DO OLTP AMARELO → STAGING
--- (Executado diariamente conforme periodicidade definida acima)
--- =============================================================================
+-- =========================================================================
+--  1) STAGING: Criação das tabelas (caso ainda não existam)
+-- =========================================================================
 
--- ---------------------------------------------------------------------------
--- E1. ENDEREÇOS
--- Full extract: carga completa a cada execução
--- ---------------------------------------------------------------------------
-TRUNCATE TABLE stg_amar_endereco;
+CREATE SCHEMA IF NOT EXISTS staging;
 
-INSERT INTO stg_amar_endereco (
-    id_endereco, uf, cep, cidade, bairro,
-    logradouro, numero, complemento
+--  1.1) stg_prique_patio
+CREATE TABLE IF NOT EXISTS staging.stg_prique_patio (
+    -- Chaves naturais do sistema de origem
+    nk_frota_origem       VARCHAR(20)  NOT NULL DEFAULT 'p-rique',
+    nk_id_patio           INT          NOT NULL,
+    -- Atributos
+    nome_patio            VARCHAR(100),
+    capacidade_vagas      INT,
+    end_cidade            VARCHAR(80),
+    end_uf                CHAR(2),
+    end_logradouro        VARCHAR(150),
+    -- Metadados de controle
+    dt_extracao           DATETIME     NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (nk_frota_origem, nk_id_patio)
+);
+
+--  1.2) stg_prique_grupo
+--       No OLTP Amarelo, "Categoria" corresponde a "Grupo" no modelo DW.
+CREATE TABLE IF NOT EXISTS staging.stg_prique_grupo (
+    nk_frota_origem       VARCHAR(20)  NOT NULL DEFAULT 'p-rique',
+    nk_id_grupo           INT          NOT NULL,
+    nome_grupo            VARCHAR(80),
+    codigo_grupo          VARCHAR(10),
+    classe_luxo           VARCHAR(30),
+    -- Tarifa vigente (valor_diaria_base da Categoria)
+    valor_diaria          DECIMAL(12,2),
+    dt_extracao           DATETIME     NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (nk_frota_origem, nk_id_grupo)
+);
+
+
+--  1.3) stg_prique_veiculo
+CREATE TABLE IF NOT EXISTS staging.stg_prique_veiculo (
+    nk_frota_origem       VARCHAR(20)  NOT NULL DEFAULT 'p-rique',
+    nk_id_veiculo         INT          NOT NULL,
+    nk_id_grupo           INT,          -- FK para stg_prique_grupo (Id_categoria)
+    nk_id_patio_origem    INT,          -- FK para stg_prique_patio (via Vaga)
+    placa                 VARCHAR(10),
+    marca                 VARCHAR(50),
+    modelo                VARCHAR(60),
+    versao                VARCHAR(50),
+    mecanizacao           VARCHAR(20),
+    tem_ar_condicionado   TINYINT(1),
+    ano_fabricacao        INT,
+    situacao              VARCHAR(20),
+    dt_extracao           DATETIME     NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (nk_frota_origem, nk_id_veiculo)
+);
+
+
+--  1.4) stg_prique_cliente
+CREATE TABLE IF NOT EXISTS staging.stg_prique_cliente (
+    nk_frota_origem       VARCHAR(20)  NOT NULL DEFAULT 'p-rique',
+    nk_id_cliente         INT          NOT NULL,
+    tipo_cliente          VARCHAR(2),       -- 'PF' ou 'PJ'
+    nome                  VARCHAR(150),
+    email                 VARCHAR(150),
+    cidade_origem         VARCHAR(80),
+    end_uf                CHAR(2),
+    end_cidade            VARCHAR(80),
+    -- Campos PF (nullable quando PJ)
+    cpf                   VARCHAR(11),
+    -- Campos PJ (nullable quando PF)
+    cnpj                  VARCHAR(14),
+    nome_fantasia         VARCHAR(150),
+    dt_extracao           DATETIME     NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (nk_frota_origem, nk_id_cliente)
+);
+
+
+--  1.5) stg_prique_reserva
+CREATE TABLE IF NOT EXISTS staging.stg_prique_reserva (
+    nk_frota_origem           VARCHAR(10)  NOT NULL DEFAULT 'p-rique',
+    nk_id_reserva             INT          NOT NULL,
+    nk_id_cliente             INT,
+    nk_id_grupo               INT,
+    nk_id_patio_retirada      INT,
+    nk_id_patio_fim           INT,
+    -- Datas (extraídas como DATE para bater com Dim_Tempo)
+    data_reserva              DATE,
+    data_retirada_prevista    DATE,
+    data_devolucao_prevista   DATE,
+    -- Medidas
+    duracao_prevista_dias     INT,
+    valor_previsto_reserva    DECIMAL(12,2),
+    -- Dimensão degenerada
+    status_reserva            VARCHAR(30),
+    dt_extracao               DATETIME     NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (nk_frota_origem, nk_id_reserva)
+);
+
+
+--  1.6) stg_prique_locacao
+CREATE TABLE IF NOT EXISTS staging.stg_prique_locacao (
+    nk_frota_origem           VARCHAR(10)  NOT NULL DEFAULT 'p-rique',
+    nk_id_locacao             INT          NOT NULL,
+    nk_id_cliente             INT,
+    nk_id_veiculo             INT,
+    nk_id_grupo               INT,       -- extraído via Veiculo.Id_categoria
+    nk_id_patio_retirada      INT,
+    nk_id_patio_devolucao     INT,
+    -- Datas como DATE
+    data_retirada             DATE,
+    data_prev_devolucao       DATE,
+    data_real_devolucao       DATE,          -- NULL se locação em andamento
+    -- Medidas financeiras
+    valor_diaria_aplicada     DECIMAL(12,2),
+    valor_final               DECIMAL(14,2),
+    dt_extracao               DATETIME      NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (nk_frota_origem, nk_id_locacao)
+);
+
+
+--  1.7) stg_prique_snapshot_patio  (para Fato_Inventario_Patio)
+--       Snapshot diário: um registro por veículo em pátio por data.
+--       Veículo está no pátio quando Id_vaga IS NOT NULL.
+CREATE TABLE IF NOT EXISTS staging.stg_prique_snapshot_patio (
+    nk_frota_origem       VARCHAR(20)  NOT NULL DEFAULT 'p-rique',
+    nk_id_patio           INT          NOT NULL,
+    nk_id_veiculo         INT          NOT NULL,
+    nk_id_grupo           INT,
+    data_snapshot         DATE         NOT NULL,
+    dt_extracao           DATETIME     NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (nk_frota_origem, nk_id_patio, nk_id_veiculo, data_snapshot)
+);
+
+
+
+-- =========================================================================
+--  2) PROCEDURES DE EXTRAÇÃO
+-- =========================================================================
+
+--  2.1) sp_prique_extrai_patio
+--       Carga full. JOIN com Endereco para obter dados de localização.
+DELIMITER //
+DROP PROCEDURE IF EXISTS staging.sp_prique_extrai_patio//
+CREATE PROCEDURE staging.sp_prique_extrai_patio()
+BEGIN
+
+    -- Limpa e recarrega (full load — tabela de dimensão pequena/estável)
+    TRUNCATE TABLE staging.stg_prique_patio;
+
+    INSERT INTO staging.stg_prique_patio (
+        nk_frota_origem,
+        nk_id_patio,
+        nome_patio,
+        capacidade_vagas,
+        end_cidade,
+        end_uf,
+        end_logradouro,
+        dt_extracao
+    )
+    SELECT
+        'p-rique'            AS nk_frota_origem,
+        p.Id_patio           AS nk_id_patio,
+        p.Nome_patio         AS nome_patio,
+        p.Capacidade         AS capacidade_vagas,
+        e.Cidade             AS end_cidade,
+        e.Uf                 AS end_uf,
+        e.Logradouro         AS end_logradouro,
+        NOW()                AS dt_extracao
+    FROM locadora_amarelo.Patio p
+    LEFT JOIN locadora_amarelo.Endereco e
+        ON e.Id_endereco = p.Id_endereco;
+
+END//
+
+
+--  2.2) sp_prique_extrai_grupo
+--       Carga full. No OLTP Amarelo, Categoria = Grupo do DW.
+--       valor_diaria_base é direto na tabela Categoria (sem tarifas_grupo separado).
+DROP PROCEDURE IF EXISTS staging.sp_prique_extrai_grupo//
+CREATE PROCEDURE staging.sp_prique_extrai_grupo()
+BEGIN
+
+    TRUNCATE TABLE staging.stg_prique_grupo;
+
+    INSERT INTO staging.stg_prique_grupo (
+        nk_frota_origem,
+        nk_id_grupo,
+        nome_grupo,
+        codigo_grupo,
+        classe_luxo,
+        valor_diaria,
+        dt_extracao
+    )
+    SELECT
+        'p-rique'                         AS nk_frota_origem,
+        c.Id_categoria                    AS nk_id_grupo,
+        c.Nome_categoria                  AS nome_grupo,
+        -- Amarelo não possui codigo_grupo nem classe_luxo
+        NULL                              AS codigo_grupo,
+        NULL                              AS classe_luxo,
+        COALESCE(c.Valor_diaria_base, 0)  AS valor_diaria,
+        NOW()                             AS dt_extracao
+    FROM locadora_amarelo.Categoria c;
+
+END//
+
+
+--  2.3) sp_prique_extrai_veiculo
+--       Carga full. No Amarelo, marca/modelo estão diretamente em Veiculo
+--       (não há tabela tipos_veiculo separada como no gupessanha).
+--       O pátio de origem é derivado via Vaga → Patio.
+DROP PROCEDURE IF EXISTS staging.sp_prique_extrai_veiculo//
+CREATE PROCEDURE staging.sp_prique_extrai_veiculo()
+BEGIN
+
+    TRUNCATE TABLE staging.stg_prique_veiculo;
+
+    INSERT INTO staging.stg_prique_veiculo (
+        nk_frota_origem,
+        nk_id_veiculo,
+        nk_id_grupo,
+        nk_id_patio_origem,
+        placa,
+        marca,
+        modelo,
+        versao,
+        mecanizacao,
+        tem_ar_condicionado,
+        ano_fabricacao,
+        situacao,
+        dt_extracao
+    )
+    SELECT
+        'p-rique'                           AS nk_frota_origem,
+        v.Id_veiculo                        AS nk_id_veiculo,
+        v.Id_categoria                      AS nk_id_grupo,
+        -- Pátio de origem: via Vaga (NULL se veículo fora do pátio / em locação)
+        vg.Id_patio                         AS nk_id_patio_origem,
+        v.Placa                             AS placa,
+        v.Marca                             AS marca,
+        v.Modelo                            AS modelo,
+        -- Amarelo não possui campo versão
+        NULL                                AS versao,
+        -- Normaliza mecanização para valores esperados pelo DW
+        CASE UPPER(TRIM(COALESCE(v.Tipo_cambio, '')))
+            WHEN 'MANUAL'     THEN 'MANUAL'
+            WHEN 'AUTOMATICO' THEN 'AUTOMATICO'
+            WHEN 'AUTOMATICA' THEN 'AUTOMATICO'
+            ELSE v.Tipo_cambio
+        END                                 AS mecanizacao,
+        COALESCE(v.Possui_ar_condicionado, 0) AS tem_ar_condicionado,
+        v.Ano                               AS ano_fabricacao,
+        v.Status_veiculo                    AS situacao,
+        NOW()                               AS dt_extracao
+    FROM locadora_amarelo.Veiculo v
+    LEFT JOIN locadora_amarelo.Vaga vg
+        ON vg.Id_vaga = v.Id_vaga;
+
+END//
+
+
+--  2.4) sp_prique_extrai_cliente
+--       Carga full. Consolida herança PF/PJ em linha única.
+--       Endereço extraído via JOIN com tabela Endereco do Amarelo.
+DROP PROCEDURE IF EXISTS staging.sp_prique_extrai_cliente//
+CREATE PROCEDURE staging.sp_prique_extrai_cliente()
+BEGIN
+
+    TRUNCATE TABLE staging.stg_prique_cliente;
+
+    INSERT INTO staging.stg_prique_cliente (
+        nk_frota_origem,
+        nk_id_cliente,
+        tipo_cliente,
+        nome,
+        email,
+        cidade_origem,
+        end_uf,
+        end_cidade,
+        cpf,
+        cnpj,
+        nome_fantasia,
+        dt_extracao
+    )
+    SELECT
+        'p-rique'                        AS nk_frota_origem,
+        c.Id_cliente                     AS nk_id_cliente,
+        c.Tipo_cliente                   AS tipo_cliente,
+        -- Unifica nome: PF usa Nome_cliente, PJ usa Razao_social
+        CASE
+            WHEN UPPER(TRIM(c.Tipo_cliente)) = 'PF' THEN pf.Nome_cliente
+            WHEN UPPER(TRIM(c.Tipo_cliente)) = 'PJ' THEN pj.Razao_social
+            ELSE COALESCE(pf.Nome_cliente, pj.Razao_social, 'NÃO INFORMADO')
+        END                              AS nome,
+        c.Email_cliente                  AS email,
+        -- Cidade de origem (do Endereco vinculado ao cliente)
+        e.Cidade                         AS cidade_origem,
+        e.Uf                             AS end_uf,
+        e.Cidade                         AS end_cidade,
+        -- PF: extrai CPF; PJ: NULL
+        pf.Cpf_cliente                   AS cpf,
+        -- PJ: extrai CNPJ; PF: NULL
+        pj.Cnpj_cliente                  AS cnpj,
+        pj.Nome_fantasia                 AS nome_fantasia,
+        NOW()                            AS dt_extracao
+    FROM locadora_amarelo.Cliente c
+    LEFT JOIN locadora_amarelo.Cliente_pf pf ON pf.Id_cliente = c.Id_cliente
+    LEFT JOIN locadora_amarelo.Cliente_pj pj ON pj.Id_cliente = c.Id_cliente
+    LEFT JOIN locadora_amarelo.Endereco e    ON e.Id_endereco = c.Id_endereco;
+
+END//
+
+
+--  2.5) sp_prique_extrai_reserva
+--       Carga full. Status mapeado para vocabulário DW na extração.
+DROP PROCEDURE IF EXISTS staging.sp_prique_extrai_reserva//
+CREATE PROCEDURE staging.sp_prique_extrai_reserva()
+BEGIN
+
+    TRUNCATE TABLE staging.stg_prique_reserva;
+
+    INSERT INTO staging.stg_prique_reserva (
+        nk_frota_origem,
+        nk_id_reserva,
+        nk_id_cliente,
+        nk_id_grupo,
+        nk_id_patio_retirada,
+        nk_id_patio_fim,
+        data_reserva,
+        data_retirada_prevista,
+        data_devolucao_prevista,
+        duracao_prevista_dias,
+        valor_previsto_reserva,
+        status_reserva,
+        dt_extracao
+    )
+    SELECT
+        'p-rique'                                               AS nk_frota_origem,
+        r.Id_reserva                                            AS nk_id_reserva,
+        r.Id_cliente                                            AS nk_id_cliente,
+        r.Id_categoria                                          AS nk_id_grupo,
+        r.Id_patio_previsto_retirada                            AS nk_id_patio_retirada,
+        r.Id_patio_previsto_devolucao                           AS nk_id_patio_fim,
+        -- Trunca para DATE (Dim_Tempo usa DATE)
+        DATE(r.Data_hora_reserva)                               AS data_reserva,
+        DATE(r.Data_previsao_retirada)                          AS data_retirada_prevista,
+        DATE(r.Data_previsao_devolucao)                         AS data_devolucao_prevista,
+        -- Duração em dias
+        DATEDIFF(
+            DATE(r.Data_previsao_devolucao),
+            DATE(r.Data_previsao_retirada))                     AS duracao_prevista_dias,
+        -- Valor previsto: diretamente da reserva no OLTP Amarelo
+        COALESCE(r.Valor_previsto, 0)                           AS valor_previsto_reserva,
+        -- Mapeamento de estados para vocabulário do DW
+        CASE UPPER(TRIM(COALESCE(r.Status_reserva, '')))
+            WHEN 'ATIVO'       THEN 'ATIVA'
+            WHEN 'ATIVA'       THEN 'ATIVA'
+            WHEN 'ACTIVE'      THEN 'ATIVA'
+            WHEN 'ABERTA'      THEN 'ATIVA'
+            WHEN 'CANCELADO'   THEN 'CANCELADA'
+            WHEN 'CANCELADA'   THEN 'CANCELADA'
+            WHEN 'CANCEL'      THEN 'CANCELADA'
+            WHEN 'CONVERTIDO'  THEN 'CONVERTIDA'
+            WHEN 'CONVERTIDA'  THEN 'CONVERTIDA'
+            WHEN 'CONCLUIDO'   THEN 'CONVERTIDA'
+            WHEN 'CONCLUIDA'   THEN 'CONVERTIDA'
+            WHEN 'FINALIZADO'  THEN 'CONVERTIDA'
+            WHEN 'FINALIZADA'  THEN 'CONVERTIDA'
+            ELSE COALESCE(TRIM(r.Status_reserva), 'ATIVA')
+        END                                                     AS status_reserva,
+        NOW()                                                   AS dt_extracao
+    FROM locadora_amarelo.Reserva r;
+
+END//
+
+
+--  2.6) sp_prique_extrai_locacao
+--       Carga full. Enriquecida com id_cliente (via Reserva) e id_grupo
+--       (via Veiculo.Id_categoria) para simplificar transformação e carga.
+DROP PROCEDURE IF EXISTS staging.sp_prique_extrai_locacao//
+CREATE PROCEDURE staging.sp_prique_extrai_locacao()
+BEGIN
+
+    TRUNCATE TABLE staging.stg_prique_locacao;
+
+    INSERT INTO staging.stg_prique_locacao (
+        nk_frota_origem,
+        nk_id_locacao,
+        nk_id_cliente,
+        nk_id_veiculo,
+        nk_id_grupo,
+        nk_id_patio_retirada,
+        nk_id_patio_devolucao,
+        data_retirada,
+        data_prev_devolucao,
+        data_real_devolucao,
+        valor_diaria_aplicada,
+        valor_final,
+        dt_extracao
+    )
+    SELECT
+        'p-rique'                                       AS nk_frota_origem,
+        l.Id_locacao                                    AS nk_id_locacao,
+        -- Cliente obtido via Reserva
+        r.Id_cliente                                    AS nk_id_cliente,
+        l.Id_veiculo                                    AS nk_id_veiculo,
+        -- Grupo obtido via Veiculo → Categoria
+        v.Id_categoria                                  AS nk_id_grupo,
+        l.Id_patio_real_retirada                        AS nk_id_patio_retirada,
+        -- Pátio real de devolução (NULL se em andamento)
+        l.Id_patio_real_devolucao                       AS nk_id_patio_devolucao,
+        -- Datas como DATE
+        DATE(l.Data_hora_retirada_real)                 AS data_retirada,
+        DATE(r.Data_previsao_devolucao)                 AS data_prev_devolucao,
+        DATE(l.Data_hora_devolucao_real)                AS data_real_devolucao,
+        -- Valor diária: derivado da Categoria do veículo
+        COALESCE(cat.Valor_diaria_base, 0)              AS valor_diaria_aplicada,
+        -- Valor final: diretamente do OLTP Amarelo
+        COALESCE(l.Valor_total_final, 0)                AS valor_final,
+        NOW()                                           AS dt_extracao
+    FROM locadora_amarelo.Locacao l
+    JOIN locadora_amarelo.Reserva r
+        ON r.Id_reserva = l.Id_reserva
+    JOIN locadora_amarelo.Veiculo v
+        ON v.Id_veiculo = l.Id_veiculo
+    LEFT JOIN locadora_amarelo.Categoria cat
+        ON cat.Id_categoria = v.Id_categoria;
+
+END//
+
+
+--  2.7) sp_prique_extrai_snapshot_patio
+--       Snapshot diário: veículos presentes fisicamente em cada pátio.
+--       Lógica Amarelo: veículo está no pátio quando Id_vaga IS NOT NULL.
+--       A Vaga é vinculada a um Patio, revelando a posição física do veículo.
+DROP PROCEDURE IF EXISTS staging.sp_prique_extrai_snapshot_patio//
+CREATE PROCEDURE staging.sp_prique_extrai_snapshot_patio(
+    IN p_data_snapshot DATE
 )
-SELECT
-    e.Id_endereco,
-    e.Uf,
-    e.Cep,
-    e.Cidade,
-    e.Bairro,
-    e.Logradouro,
-    e.Numero,
-    e.Complemento
-FROM locadora_amarelo.Endereco e;
+BEGIN
+    DECLARE v_data DATE;
+    SET v_data = COALESCE(p_data_snapshot, CURDATE());
 
--- ---------------------------------------------------------------------------
--- E2. CLIENTES (consolida herança PF + PJ em linha única)
--- Full extract: carga completa a cada execução
--- ---------------------------------------------------------------------------
-TRUNCATE TABLE stg_amar_cliente;
+    -- Remove snapshot anterior para este dia (re-execução segura)
+    DELETE FROM staging.stg_prique_snapshot_patio
+    WHERE data_snapshot = v_data
+      AND nk_frota_origem = 'p-rique';
 
-INSERT INTO stg_amar_cliente (
-    id_cliente, id_endereco, tipo_cliente,
-    email_cliente, telefone_cliente,
-    nome_pf, cpf_cliente, data_nascimento,
-    razao_social, nome_fantasia, cnpj_cliente
-)
-SELECT
-    c.Id_cliente,
-    c.Id_endereco,
-    c.Tipo_cliente,
-    c.Email_cliente,
-    c.Telefone_cliente,
-    -- Campos PF (NULL para clientes PJ)
-    pf.Nome_cliente             AS nome_pf,
-    pf.Cpf_cliente              AS cpf_cliente,
-    pf.Data_nascimento_cliente  AS data_nascimento,
-    -- Campos PJ (NULL para clientes PF)
-    pj.Razao_social             AS razao_social,
-    pj.Nome_fantasia            AS nome_fantasia,
-    pj.Cnpj_cliente             AS cnpj_cliente
-FROM locadora_amarelo.Cliente      c
-LEFT JOIN locadora_amarelo.Cliente_pf  pf ON c.Id_cliente = pf.Id_cliente
-LEFT JOIN locadora_amarelo.Cliente_pj  pj ON c.Id_cliente = pj.Id_cliente;
+    -- Insert: veículos que possuem Vaga atribuída (estão no pátio)
+    INSERT INTO staging.stg_prique_snapshot_patio (
+        nk_frota_origem,
+        nk_id_patio,
+        nk_id_veiculo,
+        nk_id_grupo,
+        data_snapshot,
+        dt_extracao
+    )
+    SELECT
+        'p-rique'           AS nk_frota_origem,
+        vg.Id_patio         AS nk_id_patio,
+        v.Id_veiculo        AS nk_id_veiculo,
+        v.Id_categoria      AS nk_id_grupo,
+        v_data              AS data_snapshot,
+        NOW()               AS dt_extracao
+    FROM locadora_amarelo.Veiculo v
+    JOIN locadora_amarelo.Vaga vg
+        ON vg.Id_vaga = v.Id_vaga
+    WHERE v.Id_vaga IS NOT NULL;
 
--- ---------------------------------------------------------------------------
--- E3. VEÍCULOS
--- Full extract: carga completa a cada execução
--- ---------------------------------------------------------------------------
-TRUNCATE TABLE stg_amar_veiculo;
+END//
 
-INSERT INTO stg_amar_veiculo (
-    id_veiculo, id_empresa, id_categoria, id_vaga,
-    placa, chassi, marca, modelo, ano,
-    tipo_cambio, possui_ar_condicionado, status_veiculo
-)
-SELECT
-    v.Id_veiculo,
-    v.Id_empresa,
-    v.Id_categoria,
-    v.Id_vaga,
-    v.Placa,
-    v.Chassi,
-    v.Marca,
-    v.Modelo,
-    v.Ano,
-    v.Tipo_cambio,
-    v.Possui_ar_condicionado,
-    v.Status_veiculo
-FROM locadora_amarelo.Veiculo v;
 
--- ---------------------------------------------------------------------------
--- E4. CATEGORIAS (→ Dim_Grupo)
--- Full extract: carga completa a cada execução
--- ---------------------------------------------------------------------------
-TRUNCATE TABLE stg_amar_categoria;
+-- =========================================================================
+--  3) PROCEDURE MAIN DE EXTRAÇÃO
+--     Chama todas as extrações na ordem correta (dimensões antes de fatos).
+-- =========================================================================
 
-INSERT INTO stg_amar_categoria (
-    id_categoria, nome_categoria, descricao_categoria, valor_diaria_base
-)
-SELECT
-    c.Id_categoria,
-    c.Nome_categoria,
-    c.Descricao_categoria,
-    c.Valor_diaria_base
-FROM locadora_amarelo.Categoria c;
+DROP PROCEDURE IF EXISTS staging.sp_prique_extracao_completa//
+CREATE PROCEDURE staging.sp_prique_extracao_completa()
+BEGIN
 
--- ---------------------------------------------------------------------------
--- E5. PÁTIOS
--- Full extract: carga completa a cada execução
--- ---------------------------------------------------------------------------
-TRUNCATE TABLE stg_amar_patio;
+    -- Ordem: dimensões antes de fatos
+    CALL staging.sp_prique_extrai_patio();
+    CALL staging.sp_prique_extrai_grupo();
+    CALL staging.sp_prique_extrai_veiculo();
+    CALL staging.sp_prique_extrai_cliente();
+    CALL staging.sp_prique_extrai_reserva();
+    CALL staging.sp_prique_extrai_locacao();
+    CALL staging.sp_prique_extrai_snapshot_patio(NULL);
 
-INSERT INTO stg_amar_patio (
-    id_patio, id_empresa, id_endereco, nome_patio, capacidade
-)
-SELECT
-    p.Id_patio,
-    p.Id_empresa,
-    p.Id_endereco,
-    p.Nome_patio,
-    p.Capacidade
-FROM locadora_amarelo.Patio p;
+END//
 
--- ---------------------------------------------------------------------------
--- E6. RESERVAS
--- Full extract diário: status (Ativa/Cancelada/Convertida) muda frequentemente.
--- ---------------------------------------------------------------------------
-TRUNCATE TABLE stg_amar_reserva;
-
-INSERT INTO stg_amar_reserva (
-    id_reserva, id_cliente, id_categoria,
-    id_patio_previsto_retirada, id_patio_previsto_devolucao,
-    data_hora_reserva, data_previsao_retirada, data_previsao_devolucao,
-    valor_previsto, status_reserva
-)
-SELECT
-    r.Id_reserva,
-    r.Id_cliente,
-    r.Id_categoria,
-    r.Id_patio_previsto_retirada,
-    r.Id_patio_previsto_devolucao,
-    r.Data_hora_reserva,
-    r.Data_previsao_retirada,
-    r.Data_previsao_devolucao,
-    r.Valor_previsto,
-    r.Status_reserva
-FROM locadora_amarelo.Reserva r;
-
--- ---------------------------------------------------------------------------
--- E7. LOCAÇÕES
--- Full extract diário: inclui locações ativas (sem devolução) e encerradas.
--- Enriquecida com id_cliente (via Reserva) e id_categoria (via Veiculo)
--- para reduzir complexidade das etapas de transformação e carga.
--- ---------------------------------------------------------------------------
-TRUNCATE TABLE stg_amar_locacao;
-
-INSERT INTO stg_amar_locacao (
-    id_locacao, id_reserva, id_veiculo, id_cliente, id_categoria,
-    id_patio_real_retirada, id_patio_real_devolucao,
-    data_hora_retirada_real, data_hora_devolucao_real, data_previsao_devolucao,
-    km_retirada, km_devolucao, valor_total_final, status_locacao
-)
-SELECT
-    l.Id_locacao,
-    l.Id_reserva,
-    l.Id_veiculo,
-    r.Id_cliente                AS id_cliente,          -- via Reserva
-    v.Id_categoria              AS id_categoria,        -- via Veiculo
-    l.Id_patio_real_retirada,
-    l.Id_patio_real_devolucao,
-    l.Data_hora_retirada_real,
-    l.Data_hora_devolucao_real,
-    r.Data_previsao_devolucao   AS data_previsao_devolucao, -- via Reserva
-    l.Km_retirada,
-    l.Km_devolucao,
-    l.Valor_total_final,
-    l.Status_locacao
-FROM locadora_amarelo.Locacao  l
-JOIN locadora_amarelo.Reserva  r ON l.Id_reserva = r.Id_reserva
-JOIN locadora_amarelo.Veiculo  v ON l.Id_veiculo  = v.Id_veiculo;
-
--- ---------------------------------------------------------------------------
--- E8. INVENTÁRIO DE PÁTIO (Snapshot diário — executar às 23:59)
--- Lógica: veículo está no pátio quando seu Id_vaga IS NOT NULL.
--- A Vaga é vinculada a um Patio, revelando a posição física do veículo.
--- Nota: locações em aberto têm Id_vaga = NULL no Veiculo (veículo fora do pátio).
--- ---------------------------------------------------------------------------
--- Remove snapshot do dia atual antes de reinserir (idempotência)
-DELETE FROM stg_amar_inventario_patio
-WHERE dt_snapshot = CURDATE();
-
-INSERT INTO stg_amar_inventario_patio (
-    id_veiculo, id_patio, id_categoria, dt_snapshot
-)
-SELECT
-    v.Id_veiculo,
-    vg.Id_patio,
-    v.Id_categoria,
-    CURDATE() AS dt_snapshot
-FROM locadora_amarelo.Veiculo v
-JOIN locadora_amarelo.Vaga    vg ON v.Id_vaga = vg.Id_vaga
-WHERE v.Id_vaga IS NOT NULL;
+DELIMITER ;

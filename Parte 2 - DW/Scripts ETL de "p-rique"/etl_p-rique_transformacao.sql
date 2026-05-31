@@ -5,264 +5,536 @@
 -- Guilherme En Shih Hu (123224674)
 -- Maria Victoria França Silva Ramos (123311073)
 
+
 -- =============================================================================
--- 02_amarelo_transform.sql
--- Transformação ETL — Staging Bruto → Staging Conformado (Amarelo)
+-- etl_p-rique_transformacao.sql
+-- Transformação ETL — Staging Bruto (p-rique) → Staging Conformado
 --
--- Execução: após 01_amarelo_extract.sql, antes de 03_amarelo_load.sql
--- Banco: staging_dw
+-- Execução: após etl_p-rique_extracao.sql, antes de etl_p-rique_carga.sql
+-- Banco: staging
 --
--- Objetivo:
---   Limpar, padronizar e conformar os dados do OLTP Amarelo para que fiquem
---   alinhados ao vocabulário e estrutura do DW integrado. Cada tabela
---   'stg_amar_t_*' é a versão pronta para carga no DW.
+-- IMPORTANTE: As tabelas conformadas (stg_conf_*) e a tabela de rejeitos
+-- (stg_rejeitos_ia) já foram criadas pelo script de transformação do
+-- gupessanha. Este script apenas cria as procedures de transformação do
+-- p-rique, que populam as mesmas tabelas conformadas com
+-- nk_frota_origem = 'p-rique'.
 --
--- Principais transformações:
---   1. Endereço    → Deduplica por (cidade, estado, país); expande UF para
---                    nome completo; insere 'Não Informado' como fallback.
---   2. Cliente     → Unifica nome (PF usa nome_pf, PJ usa razao_social);
---                    normaliza tipo_cliente; resolve cidade/estado do endereço.
---   3. Veículo     → Padroniza mecanização; garante valor default para A/C.
---   4. Grupo       → Renomeia de 'Categoria' para vocabulário DW.
---   5. Pátio       → Repassa capacidade (pode ser NULL, aceito no DW).
---   6. Reserva     → Calcula duração prevista; padroniza status.
---   7. Locação     → Extrai apenas a parte DATE dos DATETIME; trata NULLs.
---   8. Inventário  → Repasse direto do staging bruto.
+-- ORDEM DE EXECUÇÃO: Este script deve rodar APÓS a transformação do
+-- gupessanha, pois o gupessanha faz TRUNCATE nas tabelas stg_conf_*.
+-- O p-rique usa DELETE seletivo (WHERE nk_frota_origem = 'p-rique')
+-- para preservar os dados do gupessanha.
+--
+-- Legenda das Transformações realizadas:
+--   T1  Normalização de frota_origem: garantir 'p-rique' em todos registros
+--   T2  Tratamento de endereços incompletos (clientes e pátios)
+--   T3  Conformação de tipo_cliente: 'PF'/'PJ' → vocabulário DW
+--   T4  Conformação de mecanizacao: tipo_cambio Amarelo → DW
+--   T5  Normalização de nome/razão social (trim, upper)
+--   T6  Mapeamento de status de reserva → Dd_status_reserva do DW
+--   T7  Cálculo de duracao_prevista e valor_previsto_reserva
+--   T8  Cálculo/validação de valor_final da locação
+--   T9  Validação de datas: rejeita registros inconsistentes
+--   T10 Tratamento de NULLs críticos (substitui por sentinelas)
+--   T11 Tratamento de capacidade de pátio nula (sentinela -1)
 -- =============================================================================
 
-USE staging_dw;
-
--- =============================================================================
--- T1. ENDEREÇOS CONFORMADOS
--- =============================================================================
--- Deduplica (cidade, estado, pais). O OLTP Amarelo armazena apenas UF (sigla),
--- sem campo de país. Expande UF para o nome completo do estado e usa 'Brasil'
--- como valor padrão de país para toda a frota Amarelo.
--- Registros com cidade NULL ou UF NULL são mapeados para 'Não Informado'.
--- =============================================================================
-DROP TABLE IF EXISTS stg_amar_t_endereco;
-
-CREATE TABLE stg_amar_t_endereco AS
-SELECT DISTINCT
-    TRIM(cidade)    AS cidade,
-    -- Converte sigla UF para nome do estado por extenso (padrão DW)
-    CASE uf
-        WHEN 'AC' THEN 'Acre'               WHEN 'AL' THEN 'Alagoas'
-        WHEN 'AP' THEN 'Amapá'              WHEN 'AM' THEN 'Amazonas'
-        WHEN 'BA' THEN 'Bahia'              WHEN 'CE' THEN 'Ceará'
-        WHEN 'DF' THEN 'Distrito Federal'   WHEN 'ES' THEN 'Espírito Santo'
-        WHEN 'GO' THEN 'Goiás'              WHEN 'MA' THEN 'Maranhão'
-        WHEN 'MT' THEN 'Mato Grosso'        WHEN 'MS' THEN 'Mato Grosso do Sul'
-        WHEN 'MG' THEN 'Minas Gerais'       WHEN 'PA' THEN 'Pará'
-        WHEN 'PB' THEN 'Paraíba'            WHEN 'PR' THEN 'Paraná'
-        WHEN 'PE' THEN 'Pernambuco'         WHEN 'PI' THEN 'Piauí'
-        WHEN 'RJ' THEN 'Rio de Janeiro'     WHEN 'RN' THEN 'Rio Grande do Norte'
-        WHEN 'RS' THEN 'Rio Grande do Sul'  WHEN 'RO' THEN 'Rondônia'
-        WHEN 'RR' THEN 'Roraima'            WHEN 'SC' THEN 'Santa Catarina'
-        WHEN 'SP' THEN 'São Paulo'          WHEN 'SE' THEN 'Sergipe'
-        WHEN 'TO' THEN 'Tocantins'
-        ELSE COALESCE(TRIM(uf), 'Não Informado')
-    END             AS estado,
-    'Brasil'        AS pais
-FROM stg_amar_endereco
-WHERE cidade IS NOT NULL
-  AND uf     IS NOT NULL;
-
--- Garante existência do endereço 'Não Informado' para uso como fallback
--- quando clientes ou pátios possuem endereço incompleto no OLTP
-INSERT INTO stg_amar_t_endereco (cidade, estado, pais)
-SELECT 'Não Informado', 'Não Informado', 'Brasil'
-WHERE NOT EXISTS (
-    SELECT 1 FROM stg_amar_t_endereco
-    WHERE cidade = 'Não Informado'
-      AND estado = 'Não Informado'
-);
 
 
--- =============================================================================
--- T2. CLIENTES CONFORMADOS
--- =============================================================================
-DROP TABLE IF EXISTS stg_amar_t_cliente;
+-- =========================================================================
+--  2) PROCEDURES DE TRANSFORMAÇÃO
+-- =========================================================================
 
-CREATE TABLE stg_amar_t_cliente AS
-SELECT
-    'AMARELO'                           AS frota_origem,
-    c.id_cliente,
-    -- Normaliza tipo: garante maiúsculas e remove espaços
-    UPPER(TRIM(c.tipo_cliente))         AS tipo_cliente,
-    -- Unifica nome: PF usa nome_pf, PJ usa razao_social
-    CASE
-        WHEN UPPER(TRIM(c.tipo_cliente)) = 'PF'
-            THEN TRIM(c.nome_pf)
-        WHEN UPPER(TRIM(c.tipo_cliente)) = 'PJ'
-            THEN TRIM(c.razao_social)
-        ELSE COALESCE(TRIM(c.nome_pf), TRIM(c.razao_social), 'Não Informado')
-    END                                 AS nome,
-    -- Resolve endereço para lookup posterior em Dim_Endereco
-    -- Se a cidade ou UF do cliente for nulo, aponta para 'Não Informado'
-    COALESCE(TRIM(e.cidade), 'Não Informado')  AS cidade,
-    CASE
-        WHEN e.uf IS NOT NULL THEN
-            CASE e.uf
-                WHEN 'AC' THEN 'Acre'               WHEN 'AL' THEN 'Alagoas'
-                WHEN 'AP' THEN 'Amapá'              WHEN 'AM' THEN 'Amazonas'
-                WHEN 'BA' THEN 'Bahia'              WHEN 'CE' THEN 'Ceará'
-                WHEN 'DF' THEN 'Distrito Federal'   WHEN 'ES' THEN 'Espírito Santo'
-                WHEN 'GO' THEN 'Goiás'              WHEN 'MA' THEN 'Maranhão'
-                WHEN 'MT' THEN 'Mato Grosso'        WHEN 'MS' THEN 'Mato Grosso do Sul'
-                WHEN 'MG' THEN 'Minas Gerais'       WHEN 'PA' THEN 'Pará'
-                WHEN 'PB' THEN 'Paraíba'            WHEN 'PR' THEN 'Paraná'
-                WHEN 'PE' THEN 'Pernambuco'         WHEN 'PI' THEN 'Piauí'
-                WHEN 'RJ' THEN 'Rio de Janeiro'     WHEN 'RN' THEN 'Rio Grande do Norte'
-                WHEN 'RS' THEN 'Rio Grande do Sul'  WHEN 'RO' THEN 'Rondônia'
-                WHEN 'RR' THEN 'Roraima'            WHEN 'SC' THEN 'Santa Catarina'
-                WHEN 'SP' THEN 'São Paulo'          WHEN 'SE' THEN 'Sergipe'
-                WHEN 'TO' THEN 'Tocantins'
-                ELSE TRIM(e.uf)
-            END
-        ELSE 'Não Informado'
-    END                                 AS estado,
-    'Brasil'                            AS pais
-FROM stg_amar_cliente         c
-LEFT JOIN stg_amar_endereco   e ON c.id_endereco = e.id_endereco;
+--  2.1) sp_prique_transforma_patio
+--       T2  Endereços incompletos: concatena logradouro + cidade + UF
+--       T11 Capacidade nula → -1 (sentinela "desconhecida")
+DELIMITER //
+DROP PROCEDURE IF EXISTS staging.sp_prique_transforma_patio//
+CREATE PROCEDURE staging.sp_prique_transforma_patio()
+BEGIN
+    DECLARE v_total   INT DEFAULT 0;
 
+    -- Remove apenas dados do p-rique (preserva dados de outras frotas)
+    DELETE FROM staging.stg_conf_patio WHERE nk_frota_origem = 'p-rique';
 
--- =============================================================================
--- T3. VEÍCULOS CONFORMADOS
--- =============================================================================
-DROP TABLE IF EXISTS stg_amar_t_veiculo;
+    INSERT INTO staging.stg_conf_patio (
+        nk_frota_origem,
+        nk_id_patio,
+        nome_patio,
+        capacidade_vagas,
+        endereco
+    )
+    SELECT
+        nk_frota_origem,
+        nk_id_patio,
+        -- T5: trim e title-case básico no nome
+        CONCAT(
+            UPPER(LEFT(TRIM(nome_patio), 1)),
+            LOWER(SUBSTRING(TRIM(nome_patio), 2))
+        )                                            AS nome_patio,
+        -- T11: capacidade nula → sentinela -1
+        COALESCE(capacidade_vagas, -1)               AS capacidade_vagas,
+        -- T2: monta endereço conformado; substitui NULLs
+        TRIM(CONCAT(
+            COALESCE(NULLIF(TRIM(end_logradouro), ''), 'NÃO INFORMADO'),
+            ', ',
+            COALESCE(NULLIF(TRIM(end_cidade), ''), 'NÃO INFORMADO'),
+            ' - ',
+            COALESCE(NULLIF(TRIM(end_uf), ''), 'XX')
+        ))                                           AS endereco
+    FROM staging.stg_prique_patio
+    WHERE nk_frota_origem = 'p-rique';
 
-CREATE TABLE stg_amar_t_veiculo AS
-SELECT
-    'AMARELO'                                       AS frota_origem,
-    v.id_veiculo,
-    UPPER(TRIM(v.placa))                            AS placa,
-    TRIM(v.marca)                                   AS marca,
-    TRIM(v.modelo)                                  AS modelo,
-    -- Padroniza mecanização para vocabulário comum entre frotas
-    CASE
-        WHEN v.tipo_cambio IS NULL                          THEN 'Não Informado'
-        WHEN UPPER(v.tipo_cambio) LIKE '%AUTO%'             THEN 'Automático'
-        WHEN UPPER(v.tipo_cambio) LIKE '%MANU%'             THEN 'Manual'
-        WHEN UPPER(v.tipo_cambio) LIKE '%CVT%'              THEN 'CVT'
-        ELSE TRIM(v.tipo_cambio)
-    END                                             AS mecanizacao,
-    -- Garante 0 quando NULL (veículo sem registro = sem ar condicionado)
-    COALESCE(v.possui_ar_condicionado, 0)           AS tem_ar_condicionado,
-    v.id_categoria                                  AS id_categoria
-FROM stg_amar_veiculo v;
+    SET v_total = ROW_COUNT();
+END//
 
 
--- =============================================================================
--- T4. GRUPOS CONFORMADOS (Categoria → Dim_Grupo)
--- =============================================================================
-DROP TABLE IF EXISTS stg_amar_t_grupo;
+--  2.2) sp_prique_transforma_grupo
+--       T10 valor_diaria NULL → 0 com aviso de rejeito (DQ)
+DROP PROCEDURE IF EXISTS staging.sp_prique_transforma_grupo//
+CREATE PROCEDURE staging.sp_prique_transforma_grupo()
+BEGIN
+    DECLARE v_total INT DEFAULT 0;
 
-CREATE TABLE stg_amar_t_grupo AS
-SELECT
-    'AMARELO'                           AS frota_origem,
-    c.id_categoria                      AS id_grupo,
-    TRIM(c.nome_categoria)              AS nome_grupo,
-    -- Valor 0.00 como fallback para categorias sem diária cadastrada
-    COALESCE(c.valor_diaria_base, 0.00) AS valor_diaria
-FROM stg_amar_categoria c;
+    -- Remove apenas dados do p-rique
+    DELETE FROM staging.stg_conf_grupo WHERE nk_frota_origem = 'p-rique';
 
+    -- Registra rejeitos: grupos sem tarifa (qualidade de dados)
+    INSERT INTO staging.stg_rejeitos_ia
+        (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+    SELECT
+        'stg_prique_grupo', nk_frota_origem, nk_id_grupo,
+        'Grupo sem valor_diaria vigente; será carregado com valor 0,00'
+    FROM staging.stg_prique_grupo
+    WHERE nk_frota_origem = 'p-rique'
+      AND (valor_diaria IS NULL OR valor_diaria = 0);
 
--- =============================================================================
--- T5. PÁTIOS CONFORMADOS
--- =============================================================================
-DROP TABLE IF EXISTS stg_amar_t_patio;
+    INSERT INTO staging.stg_conf_grupo (
+        nk_frota_origem,
+        nk_id_grupo,
+        nome_grupo,
+        valor_diaria
+    )
+    SELECT
+        nk_frota_origem,
+        nk_id_grupo,
+        CONCAT(
+            UPPER(LEFT(TRIM(COALESCE(nome_grupo, codigo_grupo, CONCAT('GRUPO ', nk_id_grupo))), 1)),
+            LOWER(SUBSTRING(TRIM(COALESCE(nome_grupo, codigo_grupo, CONCAT('GRUPO ', nk_id_grupo))), 2))
+        ),
+        COALESCE(valor_diaria, 0)
+    FROM staging.stg_prique_grupo
+    WHERE nk_frota_origem = 'p-rique';
 
-CREATE TABLE stg_amar_t_patio AS
-SELECT
-    'AMARELO'                   AS frota_origem,
-    p.id_patio,
-    TRIM(p.nome_patio)          AS nome_patio,
-    -- Capacidade pode ser NULL (pátios sem limite cadastrado — aceito no DW)
-    p.capacidade                AS capacidade_vagas
-FROM stg_amar_patio p;
-
-
--- =============================================================================
--- T6. RESERVAS CONFORMADAS
--- =============================================================================
-DROP TABLE IF EXISTS stg_amar_t_reserva;
-
-CREATE TABLE stg_amar_t_reserva AS
-SELECT
-    'AMARELO'                               AS frota_origem,
-    r.id_reserva,
-    r.id_cliente,
-    r.id_categoria                          AS id_grupo,
-    r.id_patio_previsto_retirada            AS id_patio_retirada,
-    r.id_patio_previsto_devolucao           AS id_patio_fim,
-    -- Extrai apenas DATE do DATETIME para lookup em Dim_Tempo
-    DATE(r.data_hora_reserva)               AS data_reserva,
-    DATE(r.data_previsao_retirada)          AS data_prev_retirada,
-    DATE(r.data_previsao_devolucao)         AS data_prev_devolucao,
-    -- Calcula duração prevista em dias (campo do Fato_Reserva)
-    DATEDIFF(
-        DATE(r.data_previsao_devolucao),
-        DATE(r.data_previsao_retirada)
-    )                                       AS duracao_prevista_dias,
-    COALESCE(r.valor_previsto, 0.00)        AS valor_previsto,
-    -- Padroniza status para vocabulário DW: Ativa, Cancelada, Convertida
-    CASE
-        WHEN UPPER(TRIM(r.status_reserva))
-            IN ('ATIVO','ATIVA','ACTIVE','ABERTA')          THEN 'Ativa'
-        WHEN UPPER(TRIM(r.status_reserva))
-            IN ('CANCELADO','CANCELADA','CANCEL')           THEN 'Cancelada'
-        WHEN UPPER(TRIM(r.status_reserva))
-            IN ('CONVERTIDO','CONVERTIDA','CONCLUIDO',
-                'CONCLUIDA','CONVERTED','COMPLETED',
-                'FINALIZADO','FINALIZADA')                  THEN 'Convertida'
-        ELSE COALESCE(TRIM(r.status_reserva), 'Não Informado')
-    END                                     AS status_reserva
-FROM stg_amar_reserva r
--- Filtra registros inválidos: reservas sem datas ficam fora do DW
-WHERE r.data_previsao_retirada  IS NOT NULL
-  AND r.data_previsao_devolucao IS NOT NULL
-  -- Garante que devolução prevista seja posterior ou igual à retirada
-  AND r.data_previsao_devolucao >= r.data_previsao_retirada;
+    SET v_total = ROW_COUNT();
+END//
 
 
--- =============================================================================
--- T7. LOCAÇÕES CONFORMADAS
--- =============================================================================
-DROP TABLE IF EXISTS stg_amar_t_locacao;
+--  2.3) sp_prique_transforma_veiculo
+--       T4  Conformação mecanizacao (tipo_cambio Amarelo → MANUAL/AUTOMATICO)
+--       T10 Campos obrigatórios nulos → sentinelas
+--
+--       Nota: No OLTP Amarelo, o pátio de origem é derivado de Vaga→Patio e
+--       pode ser NULL quando o veículo está em locação. Veículos sem pátio de
+--       origem recebem sentinela 0 para não serem rejeitados, já que
+--       nk_id_patio_origem NÃO é utilizado na dim_veiculo do DW.
+DROP PROCEDURE IF EXISTS staging.sp_prique_transforma_veiculo//
+CREATE PROCEDURE staging.sp_prique_transforma_veiculo()
+BEGIN
+    DECLARE v_total  INT DEFAULT 0;
+    DECLARE v_rejeit INT DEFAULT 0;
 
-CREATE TABLE stg_amar_t_locacao AS
-SELECT
-    'AMARELO'                                       AS frota_origem,
-    l.id_locacao,
-    l.id_cliente,
-    l.id_veiculo,
-    l.id_categoria                                  AS id_grupo,
-    l.id_patio_real_retirada                        AS id_patio_retirada,
-    -- Pátio de devolução: NULL quando locação ainda em aberto
-    l.id_patio_real_devolucao                       AS id_patio_devolucao,
-    -- Extrai apenas DATE para lookup em Dim_Tempo
-    DATE(l.data_hora_retirada_real)                 AS data_retirada,
-    DATE(l.data_previsao_devolucao)                 AS data_prev_devolucao,
-    -- NULL quando veículo ainda não foi devolvido
-    DATE(l.data_hora_devolucao_real)                AS data_real_devolucao,
-    -- Valor final: NULL enquanto locação em aberto (atualizado na devolução)
-    l.valor_total_final                             AS valor_final
-FROM stg_amar_locacao l
--- Apenas locações com data de retirada registrada são válidas para o fato
-WHERE l.data_hora_retirada_real IS NOT NULL;
+    -- Remove apenas dados do p-rique
+    DELETE FROM staging.stg_conf_veiculo WHERE nk_frota_origem = 'p-rique';
+
+    -- Rejeita veículos sem grupo (inconsistência de FK)
+    INSERT INTO staging.stg_rejeitos_ia
+        (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+    SELECT
+        'stg_prique_veiculo', nk_frota_origem, nk_id_veiculo,
+        'Veículo sem nk_id_grupo (Id_categoria)'
+    FROM staging.stg_prique_veiculo
+    WHERE nk_frota_origem = 'p-rique'
+      AND nk_id_grupo IS NULL;
+
+    SET v_rejeit = ROW_COUNT();
+
+    INSERT INTO staging.stg_conf_veiculo (
+        nk_frota_origem,
+        nk_id_veiculo,
+        nk_id_grupo,
+        nk_id_patio_origem,
+        placa,
+        marca,
+        modelo,
+        mecanizacao,
+        tem_ar_condicionado
+    )
+    SELECT
+        nk_frota_origem,
+        nk_id_veiculo,
+        nk_id_grupo,
+        -- Pátio de origem: sentinela 0 quando veículo está fora do pátio
+        -- (em locação ativa, sem Vaga atribuída no OLTP Amarelo).
+        -- Este campo NÃO é carregado em dim_veiculo, então o sentinela é seguro.
+        COALESCE(nk_id_patio_origem, 0)          AS nk_id_patio_origem,
+        UPPER(TRIM(placa))                       AS placa,
+        CONCAT(
+            UPPER(LEFT(TRIM(COALESCE(marca, 'NÃO INFORMADO')), 1)),
+            LOWER(SUBSTRING(TRIM(COALESCE(marca, 'NÃO INFORMADO')), 2))
+        )                                        AS marca,
+        CONCAT(
+            UPPER(LEFT(TRIM(COALESCE(modelo, 'NÃO INFORMADO')), 1)),
+            LOWER(SUBSTRING(TRIM(COALESCE(modelo, 'NÃO INFORMADO')), 2))
+        )                                        AS modelo,
+        -- T4: normaliza mecanização para 'MANUAL' ou 'AUTOMATICO'
+        CASE UPPER(TRIM(COALESCE(mecanizacao, '')))
+            WHEN 'MANUAL'     THEN 'MANUAL'
+            WHEN 'AUTOMATICA' THEN 'AUTOMATICO'
+            WHEN 'AUTOMATICO' THEN 'AUTOMATICO'
+            ELSE 'NÃO INFORMADO'
+        END                                      AS mecanizacao,
+        COALESCE(tem_ar_condicionado, FALSE)     AS tem_ar_condicionado
+    FROM staging.stg_prique_veiculo
+    WHERE nk_frota_origem = 'p-rique'
+      AND nk_id_grupo IS NOT NULL;
+
+    SET v_total = ROW_COUNT();
+END//
 
 
--- =============================================================================
--- T8. INVENTÁRIO DE PÁTIO CONFORMADO
--- =============================================================================
-DROP TABLE IF EXISTS stg_amar_t_inventario;
+--  2.4) sp_prique_transforma_cliente
+--       T2  Endereços incompletos → desnormalizado em string
+--       T3  Conformação tipo_cliente
+--       T5  Normalização de nome
+DROP PROCEDURE IF EXISTS staging.sp_prique_transforma_cliente//
+CREATE PROCEDURE staging.sp_prique_transforma_cliente()
+BEGIN
+    DECLARE v_total  INT DEFAULT 0;
+    DECLARE v_rejeit INT DEFAULT 0;
 
-CREATE TABLE stg_amar_t_inventario AS
-SELECT
-    'AMARELO'       AS frota_origem,
-    id_veiculo,
-    id_patio,
-    id_categoria    AS id_grupo,
-    dt_snapshot
-FROM stg_amar_inventario_patio;
+    -- Remove apenas dados do p-rique
+    DELETE FROM staging.stg_conf_cliente WHERE nk_frota_origem = 'p-rique';
+
+    -- Rejeita clientes sem tipo definido
+    INSERT INTO staging.stg_rejeitos_ia
+        (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+    SELECT
+        'stg_prique_cliente', nk_frota_origem, nk_id_cliente,
+        'Cliente sem tipo_cliente (PF/PJ)'
+    FROM staging.stg_prique_cliente
+    WHERE nk_frota_origem = 'p-rique'
+      AND tipo_cliente NOT IN ('PF', 'PJ');
+
+    SET v_rejeit = ROW_COUNT();
+
+    INSERT INTO staging.stg_conf_cliente (
+        nk_frota_origem,
+        nk_id_cliente,
+        tipo_cliente,
+        nome,
+        endereco
+    )
+    SELECT
+        nk_frota_origem,
+        nk_id_cliente,
+        -- T3: garante domínio 'PF'/'PJ'
+        UPPER(TRIM(tipo_cliente))                AS tipo_cliente,
+        -- T5: trim e normalização básica de nome
+        CONCAT(
+            UPPER(LEFT(TRIM(COALESCE(nome, 'NÃO IDENTIFICADO')), 1)),
+            LOWER(SUBSTRING(TRIM(COALESCE(nome, 'NÃO IDENTIFICADO')), 2))
+        )                                        AS nome,
+        -- T2: endereço conformado (desnormalizado em string única)
+        TRIM(CONCAT(
+            COALESCE(NULLIF(TRIM(end_cidade), ''), 'NÃO INFORMADO'),
+            ' - ',
+            COALESCE(NULLIF(TRIM(end_uf), ''), 'XX')
+        ))                                       AS endereco
+    FROM staging.stg_prique_cliente
+    WHERE nk_frota_origem = 'p-rique'
+      AND tipo_cliente IN ('PF', 'PJ');
+
+    SET v_total = ROW_COUNT();
+END//
+
+
+--  2.5) sp_prique_transforma_reserva
+--       T6  Mapeamento de status para vocabulário DW (ATIVA, CANCELADA, CONVERTIDA)
+--       T7  Valida duração prevista (deve ser >= 1 dia)
+--       T9  Valida consistência de datas
+--       T10 NULLs em FKs obrigatórias → rejeito
+DROP PROCEDURE IF EXISTS staging.sp_prique_transforma_reserva//
+CREATE PROCEDURE staging.sp_prique_transforma_reserva()
+BEGIN
+    DECLARE v_total  INT DEFAULT 0;
+    DECLARE v_rejeit INT DEFAULT 0;
+
+    -- Remove apenas dados do p-rique
+    DELETE FROM staging.stg_conf_reserva WHERE nk_frota_origem = 'p-rique';
+
+    -- T9 + T10: rejeita reservas com datas inválidas ou FKs nulas
+    INSERT INTO staging.stg_rejeitos_ia
+        (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
+    SELECT
+        'stg_prique_reserva',
+        nk_frota_origem,
+        nk_id_reserva,
+        CASE
+            WHEN nk_id_cliente IS NULL            THEN 'Reserva sem cliente'
+            WHEN nk_id_grupo IS NULL              THEN 'Reserva sem grupo'
+            WHEN nk_id_patio_retirada IS NULL     THEN 'Reserva sem pátio de retirada'
+            WHEN nk_id_patio_fim IS NULL          THEN 'Reserva sem pátio de fim'
+            WHEN data_reserva IS NULL             THEN 'Reserva sem data de reserva'
+            WHEN data_retirada_prevista IS NULL   THEN 'Reserva sem data de retirada prevista'
+            WHEN data_devolucao_prevista IS NULL  THEN 'Reserva sem data de devolução prevista'
+            WHEN data_devolucao_prevista
+               < data_retirada_prevista           THEN 'Data devolução < data retirada'
+            WHEN COALESCE(duracao_prevista_dias, 0) < 0
+                                                  THEN 'Duração prevista inválida (< 0 dias)'
+        END AS motivo,
+        JSON_OBJECT(
+            'nk_id_reserva',           nk_id_reserva,
+            'nk_id_cliente',           nk_id_cliente,
+            'nk_id_grupo',             nk_id_grupo,
+            'nk_id_patio_retirada',    nk_id_patio_retirada,
+            'nk_id_patio_fim',         nk_id_patio_fim,
+            'data_reserva',            data_reserva,
+            'data_retirada_prevista',  data_retirada_prevista,
+            'data_devolucao_prevista', data_devolucao_prevista,
+            'duracao_prevista_dias',   duracao_prevista_dias,
+            'status_reserva',          status_reserva
+        )
+    FROM staging.stg_prique_reserva s
+    WHERE nk_frota_origem = 'p-rique'
+      AND (
+            nk_id_cliente IS NULL
+         OR nk_id_grupo IS NULL
+         OR nk_id_patio_retirada IS NULL
+         OR nk_id_patio_fim IS NULL
+         OR data_reserva IS NULL
+         OR data_retirada_prevista IS NULL
+         OR data_devolucao_prevista IS NULL
+         OR data_devolucao_prevista < data_retirada_prevista
+         OR COALESCE(duracao_prevista_dias, 0) < 0
+      );
+
+    SET v_rejeit = ROW_COUNT();
+
+    INSERT INTO staging.stg_conf_reserva (
+        nk_frota_origem,
+        nk_id_reserva,
+        nk_id_cliente,
+        nk_id_grupo,
+        nk_id_patio_retirada,
+        nk_id_patio_fim,
+        data_reserva,
+        data_retirada_prevista,
+        data_devolucao_prevista,
+        duracao_prevista_dias,
+        valor_previsto_reserva,
+        status_reserva
+    )
+    SELECT
+        s.nk_frota_origem,
+        s.nk_id_reserva,
+        s.nk_id_cliente,
+        s.nk_id_grupo,
+        s.nk_id_patio_retirada,
+        s.nk_id_patio_fim,
+        s.data_reserva,
+        s.data_retirada_prevista,
+        s.data_devolucao_prevista,
+        -- T7: duração recalculada para segurança (permite 0 para mesmo dia)
+        GREATEST(DATEDIFF(s.data_devolucao_prevista, s.data_retirada_prevista), 0) AS duracao_prevista_dias,
+        -- T8: valor previsto original mantido do OLTP Amarelo (não recálculo para preservar descontos)
+        COALESCE(s.valor_previsto_reserva, 0)                         AS valor_previsto_reserva,
+        -- T6: status mapeado já vem do staging; confirmamos aqui
+        CASE UPPER(TRIM(COALESCE(s.status_reserva, '')))
+            WHEN 'ATIVA'      THEN 'ATIVA'
+            WHEN 'CANCELADA'  THEN 'CANCELADA'
+            WHEN 'CONVERTIDA' THEN 'CONVERTIDA'
+            ELSE 'ATIVA'     -- default conservador
+        END                                                           AS status_reserva
+    FROM staging.stg_prique_reserva s
+    LEFT JOIN staging.stg_conf_grupo g
+        ON g.nk_frota_origem = s.nk_frota_origem
+       AND g.nk_id_grupo = s.nk_id_grupo
+    WHERE s.nk_frota_origem = 'p-rique'
+      AND s.nk_id_cliente IS NOT NULL
+      AND s.nk_id_grupo IS NOT NULL
+      AND s.nk_id_patio_retirada IS NOT NULL
+      AND s.nk_id_patio_fim IS NOT NULL
+      AND s.data_reserva IS NOT NULL
+      AND s.data_retirada_prevista IS NOT NULL
+      AND s.data_devolucao_prevista IS NOT NULL
+      AND s.data_devolucao_prevista >= s.data_retirada_prevista
+      AND COALESCE(s.duracao_prevista_dias, 0) >= 0;
+
+    SET v_total = ROW_COUNT();
+END//
+
+
+--  2.6) sp_prique_transforma_locacao
+--       T8  Cálculo e validação do valor_final
+--       T9  Validação de datas (retirada < devolução)
+--       T10 NULLs críticos → rejeito
+DROP PROCEDURE IF EXISTS staging.sp_prique_transforma_locacao//
+CREATE PROCEDURE staging.sp_prique_transforma_locacao()
+BEGIN
+    DECLARE v_total  INT DEFAULT 0;
+    DECLARE v_rejeit INT DEFAULT 0;
+
+    -- Remove apenas dados do p-rique
+    DELETE FROM staging.stg_conf_locacao WHERE nk_frota_origem = 'p-rique';
+
+    -- T9 + T10: rejeita locações com dados críticos ausentes/inválidos
+    INSERT INTO staging.stg_rejeitos_ia
+        (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
+    SELECT
+        'stg_prique_locacao',
+        nk_frota_origem,
+        nk_id_locacao,
+        CASE
+            WHEN nk_id_cliente IS NULL         THEN 'Locação sem cliente'
+            WHEN nk_id_veiculo IS NULL         THEN 'Locação sem veículo'
+            WHEN nk_id_grupo IS NULL           THEN 'Locação sem grupo'
+            WHEN nk_id_patio_retirada IS NULL  THEN 'Locação sem pátio de retirada'
+            WHEN data_retirada IS NULL         THEN 'Locação sem data de retirada'
+            WHEN data_prev_devolucao IS NULL   THEN 'Locação sem data prev. devolução'
+            WHEN data_real_devolucao IS NOT NULL
+             AND data_real_devolucao < data_retirada
+                                                THEN 'Data devolução real anterior à retirada'
+        END AS motivo,
+        JSON_OBJECT(
+            'nk_id_locacao',          nk_id_locacao,
+            'nk_id_cliente',          nk_id_cliente,
+            'nk_id_veiculo',          nk_id_veiculo,
+            'nk_id_grupo',            nk_id_grupo,
+            'nk_id_patio_retirada',   nk_id_patio_retirada,
+            'data_retirada',          data_retirada,
+            'data_prev_devolucao',    data_prev_devolucao,
+            'data_real_devolucao',    data_real_devolucao,
+            'valor_final',            valor_final
+        )
+    FROM staging.stg_prique_locacao l
+    WHERE nk_frota_origem = 'p-rique'
+      AND (
+            nk_id_cliente IS NULL
+         OR nk_id_veiculo IS NULL
+         OR nk_id_grupo IS NULL
+         OR nk_id_patio_retirada IS NULL
+         OR data_retirada IS NULL
+         OR data_prev_devolucao IS NULL
+         OR (data_real_devolucao IS NOT NULL AND data_real_devolucao < data_retirada)
+      );
+
+    SET v_rejeit = ROW_COUNT();
+
+    INSERT INTO staging.stg_conf_locacao (
+        nk_frota_origem,
+        nk_id_locacao,
+        nk_id_cliente,
+        nk_id_veiculo,
+        nk_id_grupo,
+        nk_id_patio_retirada,
+        nk_id_patio_devolucao,
+        data_retirada,
+        data_prev_devolucao,
+        data_real_devolucao,
+        valor_final
+    )
+    SELECT
+        l.nk_frota_origem,
+        l.nk_id_locacao,
+        l.nk_id_cliente,
+        l.nk_id_veiculo,
+        l.nk_id_grupo,
+        l.nk_id_patio_retirada,
+        -- Pátio de devolução: NULL mantido se locação em andamento
+        l.nk_id_patio_devolucao,
+        l.data_retirada,
+        l.data_prev_devolucao,
+        l.data_real_devolucao,
+        -- T8: valor_final calculado na extração; aqui fazemos sanity-check
+        -- Se negativo (improvável, mas possível por estornos), força 0
+        GREATEST(COALESCE(l.valor_final, 0), 0) AS valor_final
+    FROM staging.stg_prique_locacao l
+    WHERE l.nk_frota_origem = 'p-rique'
+      AND nk_id_cliente IS NOT NULL
+      AND nk_id_veiculo IS NOT NULL
+      AND nk_id_grupo IS NOT NULL
+      AND nk_id_patio_retirada IS NOT NULL
+      AND data_retirada IS NOT NULL
+      AND data_prev_devolucao IS NOT NULL
+      AND (data_real_devolucao IS NULL OR data_real_devolucao >= data_retirada);
+
+    SET v_total = ROW_COUNT();
+END//
+
+
+--  2.7) sp_prique_transforma_snapshot_patio
+--       Simples passthrough com validação de NULLs críticos.
+DROP PROCEDURE IF EXISTS staging.sp_prique_transforma_snapshot_patio//
+CREATE PROCEDURE staging.sp_prique_transforma_snapshot_patio()
+BEGIN
+    DECLARE v_total INT DEFAULT 0;
+
+    -- Remove apenas dados do p-rique
+    DELETE FROM staging.stg_conf_snapshot_patio WHERE nk_frota_origem = 'p-rique';
+
+    -- Rejeita registros com NULLs em FKs
+    INSERT INTO staging.stg_rejeitos_ia
+        (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+    SELECT
+        'stg_prique_snapshot_patio', nk_frota_origem, nk_id_veiculo,
+        'Snapshot sem pátio, veículo ou grupo válidos'
+    FROM staging.stg_prique_snapshot_patio
+    WHERE nk_frota_origem = 'p-rique'
+      AND (nk_id_patio IS NULL OR nk_id_veiculo IS NULL
+           OR nk_id_grupo IS NULL OR data_snapshot IS NULL);
+
+    INSERT INTO staging.stg_conf_snapshot_patio (
+        nk_frota_origem,
+        nk_id_patio,
+        nk_id_veiculo,
+        nk_id_grupo,
+        data_snapshot
+    )
+    SELECT
+        nk_frota_origem,
+        nk_id_patio,
+        nk_id_veiculo,
+        nk_id_grupo,
+        data_snapshot
+    FROM staging.stg_prique_snapshot_patio
+    WHERE nk_frota_origem = 'p-rique'
+      AND nk_id_patio IS NOT NULL
+      AND nk_id_veiculo IS NOT NULL
+      AND nk_id_grupo IS NOT NULL
+      AND data_snapshot IS NOT NULL;
+
+    SET v_total = ROW_COUNT();
+END//
+
+
+
+-- =========================================================================
+--  3) PROCEDURE MAIN DE TRANSFORMAÇÃO
+-- =========================================================================
+
+DROP PROCEDURE IF EXISTS staging.sp_prique_transformacao_completa//
+CREATE PROCEDURE staging.sp_prique_transformacao_completa()
+BEGIN
+
+    -- Ordem: dimensões antes de fatos (fatos referenciam conf_grupo para recalcular valor_previsto_reserva)
+    CALL staging.sp_prique_transforma_patio();
+    CALL staging.sp_prique_transforma_grupo();
+    CALL staging.sp_prique_transforma_veiculo();
+    CALL staging.sp_prique_transforma_cliente();
+    CALL staging.sp_prique_transforma_reserva();
+    CALL staging.sp_prique_transforma_locacao();
+    CALL staging.sp_prique_transforma_snapshot_patio();
+
+END//
+
+DELIMITER ;
