@@ -51,6 +51,21 @@ END;
 
 --  2) PROCEDURES DE CARGA — DIMENSÕES
 
+--  2.0) sp_gupessanha_carga_dim_endereco
+DROP PROCEDURE IF EXISTS dw.sp_gupessanha_carga_dim_endereco;
+CREATE PROCEDURE dw.sp_gupessanha_carga_dim_endereco()
+BEGIN
+    INSERT IGNORE INTO dw.dim_endereco (cidade, estado, pais)
+    SELECT DISTINCT end_cidade, end_uf, end_pais
+    FROM staging.stg_conf_patio
+    WHERE nk_frota_origem = 'gupessanha' AND end_cidade IS NOT NULL;
+
+    INSERT IGNORE INTO dw.dim_endereco (cidade, estado, pais)
+    SELECT DISTINCT end_cidade, end_uf, end_pais
+    FROM staging.stg_conf_cliente
+    WHERE nk_frota_origem = 'gupessanha' AND end_cidade IS NOT NULL;
+END;
+
 --  2.1) sp_gupessanha_carga_dim_patio
 DROP PROCEDURE IF EXISTS dw.sp_gupessanha_carga_dim_patio;
 CREATE PROCEDURE dw.sp_gupessanha_carga_dim_patio()
@@ -61,21 +76,23 @@ BEGIN
         nk_frota_origem,
         nk_id_patio,
         nome_patio,
-        capacidadeVagasPatio,
-        endereco
+        capacidade_vagas_patio,
+        sk_endereco
     )
     SELECT
-        nk_frota_origem,
-        nk_id_patio,
-        nome_patio,
-        capacidade_vagas,
-        endereco
-    FROM staging.stg_conf_patio
-    WHERE nk_frota_origem = 'gupessanha'
+        p.nk_frota_origem,
+        p.nk_id_patio,
+        p.nome_patio,
+        p.capacidade_vagas,
+        e.sk_endereco
+    FROM staging.stg_conf_patio p
+    LEFT JOIN dw.dim_endereco e
+        ON e.cidade = p.end_cidade AND e.estado = p.end_uf AND e.pais = p.end_pais
+    WHERE p.nk_frota_origem = 'gupessanha'
     ON DUPLICATE KEY UPDATE
-        nome_patio           = VALUES(nome_patio),
-        capacidadeVagasPatio = VALUES(capacidadeVagasPatio),
-        endereco             = VALUES(endereco);
+        nome_patio             = VALUES(nome_patio),
+        capacidade_vagas_patio = VALUES(capacidade_vagas_patio),
+        sk_endereco            = VALUES(sk_endereco);
 
     SET v_total = ROW_COUNT();
 END;
@@ -155,20 +172,22 @@ BEGIN
         nk_id_cliente,
         tipo_cliente,
         nome,
-        endereço
+        sk_endereco
     )
     SELECT
-        nk_frota_origem,
-        nk_id_cliente,
-        tipo_cliente,
-        nome,
-        endereco
-    FROM staging.stg_conf_cliente
-    WHERE nk_frota_origem = 'gupessanha'
+        c.nk_frota_origem,
+        c.nk_id_cliente,
+        c.tipo_cliente,
+        c.nome,
+        e.sk_endereco
+    FROM staging.stg_conf_cliente c
+    LEFT JOIN dw.dim_endereco e
+        ON e.cidade = c.end_cidade AND e.estado = c.end_uf AND e.pais = c.end_pais
+    WHERE c.nk_frota_origem = 'gupessanha'
     ON DUPLICATE KEY UPDATE
         tipo_cliente = VALUES(tipo_cliente),
         nome         = VALUES(nome),
-        endereço     = VALUES(endereço);
+        sk_endereco  = VALUES(sk_endereco);
 
     SET v_total = ROW_COUNT();
 END;
@@ -204,7 +223,7 @@ BEGIN
     CLOSE cur_datas;
 
     -- Registra rejeitos: snapshots sem SK correspondente nas dimensões
-    INSERT INTO staging.stg_rejeitos_gupessanha
+    INSERT INTO staging.stg_rejeitos_etl
         (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
     SELECT
         'stg_conf_snapshot_patio', s.nk_frota_origem, s.nk_id_veiculo,
@@ -302,7 +321,7 @@ BEGIN
     CLOSE cur_datas;
 
     -- Registra rejeitos: FKs que não resolvem para SK
-    INSERT INTO staging.stg_rejeitos_gupessanha
+    INSERT INTO staging.stg_rejeitos_etl
         (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
     SELECT
         'stg_conf_locacao', l.nk_frota_origem, l.nk_id_locacao,
@@ -429,7 +448,7 @@ BEGIN
     CLOSE cur_datas;
 
     -- Rejeitos
-    INSERT INTO staging.stg_rejeitos_gupessanha
+    INSERT INTO staging.stg_rejeitos_etl
         (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
     SELECT
         'stg_conf_reserva', r.nk_frota_origem, r.nk_id_reserva,
@@ -531,6 +550,7 @@ CREATE PROCEDURE dw.sp_gupessanha_carga_completa()
 BEGIN
 
     -- Dimensões primeiro (fatos referenciam SKs das dimensões)
+    CALL dw.sp_gupessanha_carga_dim_endereco();
     CALL dw.sp_gupessanha_carga_dim_patio();
     CALL dw.sp_gupessanha_carga_dim_grupo();
     CALL dw.sp_gupessanha_carga_dim_veiculo();
@@ -562,5 +582,5 @@ END;
 
   -- Verificar rejeitos:
   SELECT * FROM staging.vw_gupessanha_qualidade_etl;
-  SELECT * FROM staging.stg_rejeitos_gupessanha ORDER BY dt_rejeito DESC LIMIT 50;
+  SELECT * FROM staging.stg_rejeitos_etl ORDER BY dt_rejeito DESC LIMIT 50;
 */

@@ -523,3 +523,302 @@ BEGIN
 END//
 
 DELIMITER ;
+
+
+-- =========================================================================
+--  4) TRIGGERS DE EXTRAÇÃO (Event-Driven)
+--     Substituem as procedures de extração para operação em tempo real.
+--     Cada INSERT/UPDATE no OLTP Amarelo replica no staging bruto.
+--
+--     NOTA: As procedures batch (seção 2 e 3) são mantidas para:
+--       - Carga inicial (full load)
+--       - Re-execução manual / recuperação
+--     As triggers abaixo funcionam para operação contínua.
+--
+--     NOTA 2: O snapshot de pátio (stg_prique_snapshot_patio) NÃO é coberto
+--     por triggers — continua como procedure agendada diariamente.
+-- =========================================================================
+
+DELIMITER //
+
+-- 4.1) Patio
+DROP TRIGGER IF EXISTS locadora_amarelo.trg_extrai_prique_patio_ai//
+CREATE TRIGGER locadora_amarelo.trg_extrai_prique_patio_ai
+AFTER INSERT ON locadora_amarelo.Patio
+FOR EACH ROW
+BEGIN
+    INSERT INTO staging.stg_prique_patio (
+        nk_frota_origem, nk_id_patio, nome_patio, capacidade_vagas,
+        end_cidade, end_uf, end_logradouro, dt_extracao
+    )
+    SELECT 'p-rique', NEW.Id_patio, NEW.Nome_patio, NEW.Capacidade,
+           e.Cidade, e.Uf, e.Logradouro, NOW()
+    FROM locadora_amarelo.Endereco e
+    WHERE e.Id_endereco = NEW.Id_endereco
+    ON DUPLICATE KEY UPDATE
+        nome_patio = VALUES(nome_patio), capacidade_vagas = VALUES(capacidade_vagas),
+        end_cidade = VALUES(end_cidade), end_uf = VALUES(end_uf),
+        end_logradouro = VALUES(end_logradouro), dt_extracao = NOW();
+END//
+
+DROP TRIGGER IF EXISTS locadora_amarelo.trg_extrai_prique_patio_au//
+CREATE TRIGGER locadora_amarelo.trg_extrai_prique_patio_au
+AFTER UPDATE ON locadora_amarelo.Patio
+FOR EACH ROW
+BEGIN
+    INSERT INTO staging.stg_prique_patio (
+        nk_frota_origem, nk_id_patio, nome_patio, capacidade_vagas,
+        end_cidade, end_uf, end_logradouro, dt_extracao
+    )
+    SELECT 'p-rique', NEW.Id_patio, NEW.Nome_patio, NEW.Capacidade,
+           e.Cidade, e.Uf, e.Logradouro, NOW()
+    FROM locadora_amarelo.Endereco e
+    WHERE e.Id_endereco = NEW.Id_endereco
+    ON DUPLICATE KEY UPDATE
+        nome_patio = VALUES(nome_patio), capacidade_vagas = VALUES(capacidade_vagas),
+        end_cidade = VALUES(end_cidade), end_uf = VALUES(end_uf),
+        end_logradouro = VALUES(end_logradouro), dt_extracao = NOW();
+END//
+
+-- 4.2) Grupo (Categoria)
+DROP TRIGGER IF EXISTS locadora_amarelo.trg_extrai_prique_grupo_ai//
+CREATE TRIGGER locadora_amarelo.trg_extrai_prique_grupo_ai
+AFTER INSERT ON locadora_amarelo.Categoria
+FOR EACH ROW
+BEGIN
+    INSERT INTO staging.stg_prique_grupo (
+        nk_frota_origem, nk_id_grupo, nome_grupo, valor_diaria, dt_extracao
+    ) VALUES (
+        'p-rique', NEW.Id_categoria, NEW.Nome_categoria,
+        COALESCE(NEW.Valor_diaria_base, 0), NOW()
+    ) ON DUPLICATE KEY UPDATE
+        nome_grupo = VALUES(nome_grupo), valor_diaria = VALUES(valor_diaria), dt_extracao = NOW();
+END//
+
+DROP TRIGGER IF EXISTS locadora_amarelo.trg_extrai_prique_grupo_au//
+CREATE TRIGGER locadora_amarelo.trg_extrai_prique_grupo_au
+AFTER UPDATE ON locadora_amarelo.Categoria
+FOR EACH ROW
+BEGIN
+    INSERT INTO staging.stg_prique_grupo (
+        nk_frota_origem, nk_id_grupo, nome_grupo, valor_diaria, dt_extracao
+    ) VALUES (
+        'p-rique', NEW.Id_categoria, NEW.Nome_categoria,
+        COALESCE(NEW.Valor_diaria_base, 0), NOW()
+    ) ON DUPLICATE KEY UPDATE
+        nome_grupo = VALUES(nome_grupo), valor_diaria = VALUES(valor_diaria), dt_extracao = NOW();
+END//
+
+-- 4.3) Veiculo
+DROP TRIGGER IF EXISTS locadora_amarelo.trg_extrai_prique_veiculo_ai//
+CREATE TRIGGER locadora_amarelo.trg_extrai_prique_veiculo_ai
+AFTER INSERT ON locadora_amarelo.Veiculo
+FOR EACH ROW
+BEGIN
+    INSERT INTO staging.stg_prique_veiculo (
+        nk_frota_origem, nk_id_veiculo, nk_id_grupo, nk_id_patio_origem,
+        placa, marca, modelo, mecanizacao, tem_ar_condicionado,
+        ano_fabricacao, situacao, dt_extracao
+    )
+    SELECT 'p-rique', NEW.Id_veiculo, NEW.Id_categoria, vg.Id_patio,
+           NEW.Placa, NEW.Marca, NEW.Modelo,
+           CASE UPPER(TRIM(COALESCE(NEW.Tipo_cambio, '')))
+               WHEN 'MANUAL' THEN 'MANUAL' WHEN 'AUTOMATICO' THEN 'AUTOMATICO'
+               WHEN 'AUTOMATICA' THEN 'AUTOMATICO' ELSE NEW.Tipo_cambio END,
+           COALESCE(NEW.Possui_ar_condicionado, 0), NEW.Ano, NEW.Status_veiculo, NOW()
+    FROM (SELECT 1) dummy
+    LEFT JOIN locadora_amarelo.Vaga vg ON vg.Id_vaga = NEW.Id_vaga
+    ON DUPLICATE KEY UPDATE
+        nk_id_grupo = VALUES(nk_id_grupo), nk_id_patio_origem = VALUES(nk_id_patio_origem),
+        placa = VALUES(placa), marca = VALUES(marca), modelo = VALUES(modelo),
+        mecanizacao = VALUES(mecanizacao), tem_ar_condicionado = VALUES(tem_ar_condicionado),
+        situacao = VALUES(situacao), dt_extracao = NOW();
+END//
+
+DROP TRIGGER IF EXISTS locadora_amarelo.trg_extrai_prique_veiculo_au//
+CREATE TRIGGER locadora_amarelo.trg_extrai_prique_veiculo_au
+AFTER UPDATE ON locadora_amarelo.Veiculo
+FOR EACH ROW
+BEGIN
+    INSERT INTO staging.stg_prique_veiculo (
+        nk_frota_origem, nk_id_veiculo, nk_id_grupo, nk_id_patio_origem,
+        placa, marca, modelo, mecanizacao, tem_ar_condicionado,
+        ano_fabricacao, situacao, dt_extracao
+    )
+    SELECT 'p-rique', NEW.Id_veiculo, NEW.Id_categoria, vg.Id_patio,
+           NEW.Placa, NEW.Marca, NEW.Modelo,
+           CASE UPPER(TRIM(COALESCE(NEW.Tipo_cambio, '')))
+               WHEN 'MANUAL' THEN 'MANUAL' WHEN 'AUTOMATICO' THEN 'AUTOMATICO'
+               WHEN 'AUTOMATICA' THEN 'AUTOMATICO' ELSE NEW.Tipo_cambio END,
+           COALESCE(NEW.Possui_ar_condicionado, 0), NEW.Ano, NEW.Status_veiculo, NOW()
+    FROM (SELECT 1) dummy
+    LEFT JOIN locadora_amarelo.Vaga vg ON vg.Id_vaga = NEW.Id_vaga
+    ON DUPLICATE KEY UPDATE
+        nk_id_grupo = VALUES(nk_id_grupo), nk_id_patio_origem = VALUES(nk_id_patio_origem),
+        placa = VALUES(placa), marca = VALUES(marca), modelo = VALUES(modelo),
+        mecanizacao = VALUES(mecanizacao), tem_ar_condicionado = VALUES(tem_ar_condicionado),
+        situacao = VALUES(situacao), dt_extracao = NOW();
+END//
+
+-- 4.4) Cliente
+DROP TRIGGER IF EXISTS locadora_amarelo.trg_extrai_prique_cliente_ai//
+CREATE TRIGGER locadora_amarelo.trg_extrai_prique_cliente_ai
+AFTER INSERT ON locadora_amarelo.Cliente
+FOR EACH ROW
+BEGIN
+    INSERT INTO staging.stg_prique_cliente (
+        nk_frota_origem, nk_id_cliente, tipo_cliente, nome,
+        email, end_uf, end_cidade, cpf, cnpj, nome_fantasia, dt_extracao
+    )
+    SELECT 'p-rique', NEW.Id_cliente, NEW.Tipo_cliente,
+        CASE WHEN UPPER(TRIM(NEW.Tipo_cliente)) = 'PF' THEN pf.Nome_cliente
+             WHEN UPPER(TRIM(NEW.Tipo_cliente)) = 'PJ' THEN pj.Razao_social
+             ELSE COALESCE(pf.Nome_cliente, pj.Razao_social, 'NÃO INFORMADO') END,
+        NEW.Email_cliente, e.Uf, e.Cidade,
+        pf.Cpf_cliente, pj.Cnpj_cliente, pj.Nome_fantasia, NOW()
+    FROM (SELECT 1) dummy
+    LEFT JOIN locadora_amarelo.Cliente_pf pf ON pf.Id_cliente = NEW.Id_cliente
+    LEFT JOIN locadora_amarelo.Cliente_pj pj ON pj.Id_cliente = NEW.Id_cliente
+    LEFT JOIN locadora_amarelo.Endereco e    ON e.Id_endereco = NEW.Id_endereco
+    ON DUPLICATE KEY UPDATE
+        tipo_cliente = VALUES(tipo_cliente), nome = VALUES(nome),
+        email = VALUES(email), end_uf = VALUES(end_uf), end_cidade = VALUES(end_cidade),
+        dt_extracao = NOW();
+END//
+
+DROP TRIGGER IF EXISTS locadora_amarelo.trg_extrai_prique_cliente_au//
+CREATE TRIGGER locadora_amarelo.trg_extrai_prique_cliente_au
+AFTER UPDATE ON locadora_amarelo.Cliente
+FOR EACH ROW
+BEGIN
+    INSERT INTO staging.stg_prique_cliente (
+        nk_frota_origem, nk_id_cliente, tipo_cliente, nome,
+        email, end_uf, end_cidade, cpf, cnpj, nome_fantasia, dt_extracao
+    )
+    SELECT 'p-rique', NEW.Id_cliente, NEW.Tipo_cliente,
+        CASE WHEN UPPER(TRIM(NEW.Tipo_cliente)) = 'PF' THEN pf.Nome_cliente
+             WHEN UPPER(TRIM(NEW.Tipo_cliente)) = 'PJ' THEN pj.Razao_social
+             ELSE COALESCE(pf.Nome_cliente, pj.Razao_social, 'NÃO INFORMADO') END,
+        NEW.Email_cliente, e.Uf, e.Cidade,
+        pf.Cpf_cliente, pj.Cnpj_cliente, pj.Nome_fantasia, NOW()
+    FROM (SELECT 1) dummy
+    LEFT JOIN locadora_amarelo.Cliente_pf pf ON pf.Id_cliente = NEW.Id_cliente
+    LEFT JOIN locadora_amarelo.Cliente_pj pj ON pj.Id_cliente = NEW.Id_cliente
+    LEFT JOIN locadora_amarelo.Endereco e    ON e.Id_endereco = NEW.Id_endereco
+    ON DUPLICATE KEY UPDATE
+        tipo_cliente = VALUES(tipo_cliente), nome = VALUES(nome),
+        email = VALUES(email), end_uf = VALUES(end_uf), end_cidade = VALUES(end_cidade),
+        dt_extracao = NOW();
+END//
+
+-- 4.5) Reserva
+DROP TRIGGER IF EXISTS locadora_amarelo.trg_extrai_prique_reserva_ai//
+CREATE TRIGGER locadora_amarelo.trg_extrai_prique_reserva_ai
+AFTER INSERT ON locadora_amarelo.Reserva
+FOR EACH ROW
+BEGIN
+    INSERT INTO staging.stg_prique_reserva (
+        nk_frota_origem, nk_id_reserva, nk_id_cliente, nk_id_grupo,
+        nk_id_patio_retirada, nk_id_patio_fim,
+        data_reserva, data_retirada_prevista, data_devolucao_prevista,
+        duracao_prevista_dias, valor_previsto_reserva, status_reserva, dt_extracao
+    ) VALUES (
+        'p-rique', NEW.Id_reserva, NEW.Id_cliente, NEW.Id_categoria,
+        NEW.Id_patio_previsto_retirada, NEW.Id_patio_previsto_devolucao,
+        DATE(NEW.Data_hora_reserva), DATE(NEW.Data_previsao_retirada), DATE(NEW.Data_previsao_devolucao),
+        DATEDIFF(DATE(NEW.Data_previsao_devolucao), DATE(NEW.Data_previsao_retirada)),
+        COALESCE(NEW.Valor_previsto, 0),
+        CASE UPPER(TRIM(COALESCE(NEW.Status_reserva, '')))
+            WHEN 'ATIVO' THEN 'ATIVA' WHEN 'ATIVA' THEN 'ATIVA'
+            WHEN 'CANCELADO' THEN 'CANCELADA' WHEN 'CANCELADA' THEN 'CANCELADA'
+            WHEN 'CONVERTIDO' THEN 'CONVERTIDA' WHEN 'CONVERTIDA' THEN 'CONVERTIDA'
+            WHEN 'CONCLUIDO' THEN 'CONVERTIDA' WHEN 'FINALIZADO' THEN 'CONVERTIDA'
+            ELSE COALESCE(TRIM(NEW.Status_reserva), 'ATIVA') END,
+        NOW()
+    ) ON DUPLICATE KEY UPDATE
+        status_reserva = VALUES(status_reserva), valor_previsto_reserva = VALUES(valor_previsto_reserva),
+        dt_extracao = NOW();
+END//
+
+DROP TRIGGER IF EXISTS locadora_amarelo.trg_extrai_prique_reserva_au//
+CREATE TRIGGER locadora_amarelo.trg_extrai_prique_reserva_au
+AFTER UPDATE ON locadora_amarelo.Reserva
+FOR EACH ROW
+BEGIN
+    INSERT INTO staging.stg_prique_reserva (
+        nk_frota_origem, nk_id_reserva, nk_id_cliente, nk_id_grupo,
+        nk_id_patio_retirada, nk_id_patio_fim,
+        data_reserva, data_retirada_prevista, data_devolucao_prevista,
+        duracao_prevista_dias, valor_previsto_reserva, status_reserva, dt_extracao
+    ) VALUES (
+        'p-rique', NEW.Id_reserva, NEW.Id_cliente, NEW.Id_categoria,
+        NEW.Id_patio_previsto_retirada, NEW.Id_patio_previsto_devolucao,
+        DATE(NEW.Data_hora_reserva), DATE(NEW.Data_previsao_retirada), DATE(NEW.Data_previsao_devolucao),
+        DATEDIFF(DATE(NEW.Data_previsao_devolucao), DATE(NEW.Data_previsao_retirada)),
+        COALESCE(NEW.Valor_previsto, 0),
+        CASE UPPER(TRIM(COALESCE(NEW.Status_reserva, '')))
+            WHEN 'ATIVO' THEN 'ATIVA' WHEN 'ATIVA' THEN 'ATIVA'
+            WHEN 'CANCELADO' THEN 'CANCELADA' WHEN 'CANCELADA' THEN 'CANCELADA'
+            WHEN 'CONVERTIDO' THEN 'CONVERTIDA' WHEN 'CONVERTIDA' THEN 'CONVERTIDA'
+            WHEN 'CONCLUIDO' THEN 'CONVERTIDA' WHEN 'FINALIZADO' THEN 'CONVERTIDA'
+            ELSE COALESCE(TRIM(NEW.Status_reserva), 'ATIVA') END,
+        NOW()
+    ) ON DUPLICATE KEY UPDATE
+        status_reserva = VALUES(status_reserva), valor_previsto_reserva = VALUES(valor_previsto_reserva),
+        dt_extracao = NOW();
+END//
+
+-- 4.6) Locação
+DROP TRIGGER IF EXISTS locadora_amarelo.trg_extrai_prique_locacao_ai//
+CREATE TRIGGER locadora_amarelo.trg_extrai_prique_locacao_ai
+AFTER INSERT ON locadora_amarelo.Locacao
+FOR EACH ROW
+BEGIN
+    INSERT INTO staging.stg_prique_locacao (
+        nk_frota_origem, nk_id_locacao, nk_id_cliente, nk_id_veiculo,
+        nk_id_grupo, nk_id_patio_retirada, nk_id_patio_devolucao,
+        data_retirada, data_prev_devolucao, data_real_devolucao,
+        valor_diaria_aplicada, valor_final, dt_extracao
+    )
+    SELECT 'p-rique', NEW.Id_locacao, r.Id_cliente, NEW.Id_veiculo,
+           v.Id_categoria, NEW.Id_patio_real_retirada, NEW.Id_patio_real_devolucao,
+           DATE(NEW.Data_hora_retirada_real), DATE(r.Data_previsao_devolucao),
+           DATE(NEW.Data_hora_devolucao_real),
+           COALESCE(cat.Valor_diaria_base, 0), COALESCE(NEW.Valor_total_final, 0), NOW()
+    FROM locadora_amarelo.Reserva r
+    JOIN locadora_amarelo.Veiculo v ON v.Id_veiculo = NEW.Id_veiculo
+    LEFT JOIN locadora_amarelo.Categoria cat ON cat.Id_categoria = v.Id_categoria
+    WHERE r.Id_reserva = NEW.Id_reserva
+    ON DUPLICATE KEY UPDATE
+        nk_id_patio_devolucao = VALUES(nk_id_patio_devolucao),
+        data_real_devolucao = VALUES(data_real_devolucao),
+        valor_final = VALUES(valor_final), dt_extracao = NOW();
+END//
+
+DROP TRIGGER IF EXISTS locadora_amarelo.trg_extrai_prique_locacao_au//
+CREATE TRIGGER locadora_amarelo.trg_extrai_prique_locacao_au
+AFTER UPDATE ON locadora_amarelo.Locacao
+FOR EACH ROW
+BEGIN
+    INSERT INTO staging.stg_prique_locacao (
+        nk_frota_origem, nk_id_locacao, nk_id_cliente, nk_id_veiculo,
+        nk_id_grupo, nk_id_patio_retirada, nk_id_patio_devolucao,
+        data_retirada, data_prev_devolucao, data_real_devolucao,
+        valor_diaria_aplicada, valor_final, dt_extracao
+    )
+    SELECT 'p-rique', NEW.Id_locacao, r.Id_cliente, NEW.Id_veiculo,
+           v.Id_categoria, NEW.Id_patio_real_retirada, NEW.Id_patio_real_devolucao,
+           DATE(NEW.Data_hora_retirada_real), DATE(r.Data_previsao_devolucao),
+           DATE(NEW.Data_hora_devolucao_real),
+           COALESCE(cat.Valor_diaria_base, 0), COALESCE(NEW.Valor_total_final, 0), NOW()
+    FROM locadora_amarelo.Reserva r
+    JOIN locadora_amarelo.Veiculo v ON v.Id_veiculo = NEW.Id_veiculo
+    LEFT JOIN locadora_amarelo.Categoria cat ON cat.Id_categoria = v.Id_categoria
+    WHERE r.Id_reserva = NEW.Id_reserva
+    ON DUPLICATE KEY UPDATE
+        nk_id_patio_devolucao = VALUES(nk_id_patio_devolucao),
+        data_real_devolucao = VALUES(data_real_devolucao),
+        valor_final = VALUES(valor_final), dt_extracao = NOW();
+END//
+
+DELIMITER ;
