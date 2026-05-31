@@ -1,3 +1,9 @@
+-- Grupo:
+-- Bernardo Brandão Pozzato Carvalho Costa (123289593)
+-- Enzo de Carvalho Sampaio (123386206)
+-- Giovanni Faletti Almeida (123184214)
+-- Guilherme En Shih Hu (123224674)
+-- Maria Victoria França Silva Ramos (123311073)
 -- =============================================================================
 -- DW_agendamento.sql
 -- Configuração do MySQL Event Scheduler para Cargas Diárias (Batch)

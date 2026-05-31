@@ -1,6 +1,3 @@
--- ============================================================================
--- TRABALHO DE BIG DATA / DATA WAREHOUSE - MAE016 (PARTE II)
--- ----------------------------------------------------------------------------
 -- Grupo:
 -- Bernardo Brandão Pozzato Carvalho Costa (123289593)
 -- Enzo de Carvalho Sampaio (123386206)
