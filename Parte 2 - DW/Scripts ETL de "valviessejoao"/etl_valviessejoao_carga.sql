@@ -4,40 +4,14 @@
 -- Giovanni Faletti Almeida (123184214)
 -- Guilherme En Shih Hu (123224674)
 -- Maria Victoria França Silva Ramos (123311073)
--- ----------------------------------------------------------------------------
--- Arquivo : 03_carga_NOVOOK.sql
--- Etapa   : CARGA  (o "L"/Load do ETL)
--- Entrada : Area de STAGING conformada (dw_staging.trf_*) -- gerada pelo script 02
--- Saida   : DATA WAREHOUSE estrela (schema dw_locadora) -- dim_* e fato_*
--- SGBD    : MySQL 8.x
---
--- O que esta etapa faz:
---   1. Garante a existencia do ESQUEMA ESTRELA (CREATE TABLE IF NOT EXISTS) tal
---      como descrito no "Modelo dw". (Se o esquema ja existir, nada e refeito.)
---   2. Popula a Dim_Tempo (pre-populada + datas referenciadas pelos fatos).
---   3. Carrega as DIMENSOES gerando/atualizando as Surrogate Keys (SK):
---        - faz UPSERT pela Chave Natural (nk_frota_origem + nk_id_*);
---        - resolve sk_endereco do cliente por JOIN na Dim_Endereco.
---   4. Carrega os FATOS resolvendo TODAS as SKs por JOIN nas dimensoes.
---
--- Decisao de projeto sobre a Dim_Tempo:
---   sk_tempo usa o formato YYYYMMDD (ex.: 2026-05-31 -> 20260531). Preferimos
---   YYYYMMDD a DDMMYYYY porque YYYYMMDD e crescente no tempo (ordenavel), que e
---   o padrao para "smart keys" de dimensao tempo. A coluna "data" guarda a DATE
---   real; a apresentacao DD/MM/AAAA fica a cargo dos relatorios.
---
--- OBS: A carga e IDEMPOTENTE (INSERT ... ON DUPLICATE KEY UPDATE). Pode rodar
---      varias vezes; linhas existentes sao atualizadas, nao duplicadas.
--- ============================================================================
+
 
 CREATE DATABASE IF NOT EXISTS dw_locadora
   CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 USE dw_locadora;
 
--- ============================================================================
 -- 1) ESQUEMA ESTRELA (cria apenas se ainda nao existir)
 --    Dimensoes primeiro; fatos por ultimo (por causa das FKs).
--- ============================================================================
 
 -- ---- Dim_Endereco -----------------------------------------------------------
 CREATE TABLE IF NOT EXISTS dim_endereco (
@@ -177,9 +151,8 @@ CREATE TABLE IF NOT EXISTS fato_reserva (
     CONSTRAINT fk_res_patio_fim   FOREIGN KEY (sk_patio_fim)            REFERENCES dim_patio (sk_patio)
 ) ENGINE=InnoDB;
 
--- ============================================================================
+
 -- 2) FUNCAO AUXILIAR: data -> sk_tempo (YYYYMMDD)
--- ============================================================================
 DROP FUNCTION IF EXISTS fn_sk_tempo;
 DELIMITER $$
 CREATE FUNCTION fn_sk_tempo(d DATE) RETURNS INT
@@ -187,9 +160,7 @@ DETERMINISTIC NO SQL
 RETURN IF(d IS NULL, NULL, YEAR(d) * 10000 + MONTH(d) * 100 + DAY(d))$$
 DELIMITER ;
 
--- ============================================================================
 -- 3) PROCEDURES DE CARGA
--- ============================================================================
 DROP PROCEDURE IF EXISTS sp_popula_dim_tempo;
 DROP PROCEDURE IF EXISTS sp_garante_datas_dim_tempo;
 DROP PROCEDURE IF EXISTS sp_carga_dimensoes;
@@ -372,22 +343,7 @@ END$$
 
 DELIMITER ;
 
--- ============================================================================
 -- 4) EXECUCAO DA CARGA
--- ============================================================================
+
 CALL sp_carga_tudo();
 
--- ----------------------------------------------------------------------------
--- 5) CONFERENCIA RAPIDA (opcional) - descomente para validar a carga
--- ----------------------------------------------------------------------------
--- SELECT 'dim_endereco' tabela, COUNT(*) linhas FROM dim_endereco
--- UNION ALL SELECT 'dim_cliente',  COUNT(*) FROM dim_cliente
--- UNION ALL SELECT 'dim_veiculo',  COUNT(*) FROM dim_veiculo
--- UNION ALL SELECT 'dim_grupo',    COUNT(*) FROM dim_grupo
--- UNION ALL SELECT 'dim_patio',    COUNT(*) FROM dim_patio
--- UNION ALL SELECT 'dim_tempo',    COUNT(*) FROM dim_tempo
--- UNION ALL SELECT 'fato_locacao', COUNT(*) FROM fato_locacao
--- UNION ALL SELECT 'fato_reserva', COUNT(*) FROM fato_reserva
--- UNION ALL SELECT 'fato_inventario_patio', COUNT(*) FROM fato_inventario_patio;
-
--- FIM DO SCRIPT DE CARGA (NOVOOK)
