@@ -5,29 +5,11 @@
 -- Guilherme En Shih Hu (123224674)
 -- Maria Victoria França Silva Ramos (123311073)
 
--- =============================================================================
--- ARQUIVO : etl-guilherme-hu-extracao-corrigido.sql
--- ESCOPO  : Camada de Extração (E) do Processo ETL
--- FLUXO   : Banco Operacional (OLTP: locadora) → Área de Preparação (Staging)
--- =============================================================================
--- ID DA FROTA DE ORIGEM : 'guilherme-hu'
--- SCHEMA FONTE          : locadora
--- SCHEMA DESTINO        : staging (compartilhado para conformidade do DW)
--- =============================================================================
--- ARQUITETURA E ESTRATÉGIA DE CAPTURA:
---   • Abordagem Híbrida: Triggers (Event-Driven) para captura em tempo real,
---     combinada com Stored Procedures para cargas completas (Batch).
---   • Rastreabilidade: Metadado 'dt_extracao' (timestamp local) e
---     'nk_frota_origem' garantem auditoria e isolamento no DW.
--- =============================================================================
-
 SET @extracao_ts = NOW();
 
 CREATE SCHEMA IF NOT EXISTS staging;
 
--- =============================================================================
 -- 1) STAGING: Criação das Tabelas
--- =============================================================================
 
 -- 1.1) stg_guilherme_hu_patio
 CREATE TABLE IF NOT EXISTS staging.stg_guilherme_hu_patio (
@@ -143,9 +125,7 @@ BEGIN
 END//
 DELIMITER ;
 
--- =============================================================================
 -- 2) PROCEDURES DE EXTRAÇÃO
--- =============================================================================
 
 -- 2.1) sp_guilherme_hu_extrai_patio
 DROP PROCEDURE IF EXISTS staging.sp_guilherme_hu_extrai_patio;
@@ -375,9 +355,7 @@ BEGIN
 END//
 DELIMITER ;
 
--- =============================================================================
 -- 3) PROCEDURE MAIN DE EXTRAÇÃO
--- =============================================================================
 DROP PROCEDURE IF EXISTS staging.sp_guilherme_hu_extracao_completa;
 DELIMITER //
 CREATE PROCEDURE staging.sp_guilherme_hu_extracao_completa(IN p_full_load TINYINT(1))
@@ -399,10 +377,7 @@ BEGIN
 END//
 DELIMITER ;
 
--- =============================================================================
 -- 4) TRIGGERS DE EXTRAÇÃO (Event-Driven)
--- =============================================================================
-
 DELIMITER //
 
 -- 4.1) Pátio — AFTER INSERT

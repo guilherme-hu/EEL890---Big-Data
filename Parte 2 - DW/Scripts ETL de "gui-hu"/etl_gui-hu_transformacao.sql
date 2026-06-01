@@ -5,23 +5,7 @@
 -- Guilherme En Shih Hu (123224674)
 -- Maria Victoria França Silva Ramos (123311073)
 
--- -----------------------------------------------------------------------------
--- ARQUIVO : etl_guilherme_hu_transformacao.sql
--- ESCOPO  : Camada de Transformação (T) do Processo ETL
--- FLUXO   : Staging Bruto (guilherme-hu) ➔ Staging Conformado (Comum do DW)
--- -----------------------------------------------------------------------------
--- ID DA FROTA DE ORIGEM : 'guilherme-hu'
---
--- ESTRATÉGIA:
---   • Os dados da stg_guilherme_hu_* são lidos, limpos e validados.
---   • Registros válidos vão para as tabelas stg_conf_* (compartilhadas por todas frotas).
---   • Registros inválidos (ex: datas inconsistentes, FKs nulas) vão para stg_rejeitos_etl.
---   • Suporta execução Batch via Procedures e Event-Driven via Triggers.
--- -----------------------------------------------------------------------------
-
--- =============================================================================
 -- 1) TABELAS CONFORMADAS E DE REJEITOS (Garantia de Existência)
--- =============================================================================
 
 CREATE TABLE IF NOT EXISTS staging.stg_rejeitos_etl (
     id_rejeito      INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -116,9 +100,7 @@ CREATE TABLE IF NOT EXISTS staging.stg_conf_snapshot_patio (
     PRIMARY KEY (nk_frota_origem, nk_id_patio, nk_id_veiculo, data_snapshot)
 );
 
--- =============================================================================
 -- 2) PROCEDURES DE TRANSFORMAÇÃO (Carga em Lote / Batch)
--- =============================================================================
 
 -- 2.1) Patio
 DROP PROCEDURE IF EXISTS staging.sp_guilherme_hu_transforma_patio;
@@ -296,9 +278,7 @@ BEGIN
 END//
 DELIMITER ;
 
--- =============================================================================
 -- 3) PROCEDURE MAIN
--- =============================================================================
 DROP PROCEDURE IF EXISTS staging.sp_guilherme_hu_transformacao_completa;
 DELIMITER //
 CREATE PROCEDURE staging.sp_guilherme_hu_transformacao_completa()
@@ -313,9 +293,7 @@ BEGIN
 END//
 DELIMITER ;
 
--- =============================================================================
 -- 4) VIEW DE MONITORAMENTO DE QUALIDADE
--- =============================================================================
 CREATE OR REPLACE VIEW staging.vw_guilherme_hu_qualidade_etl AS
 SELECT
     tabela_origem,
@@ -328,9 +306,7 @@ WHERE nk_frota_origem = 'guilherme-hu'
 GROUP BY tabela_origem
 ORDER BY total_rejeitos DESC;
 
--- =============================================================================
 -- 5) TRIGGERS DE TRANSFORMAÇÃO (Event-Driven)
--- =============================================================================
 DELIMITER //
 
 -- Patio

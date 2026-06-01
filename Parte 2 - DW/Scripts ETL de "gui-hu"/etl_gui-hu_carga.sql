@@ -5,17 +5,7 @@
 -- Guilherme En Shih Hu (123224674)
 -- Maria Victoria França Silva Ramos (123311073)
 
-
--- -----------------------------------------------------------------------------
--- ARQUIVO : etl_guilherme_hu_carga.sql
--- ESCOPO  : Camada de Carga (L) do Processo ETL
--- FLUXO   : Staging Conformado (stg_conf_*) ➔ Data Warehouse (dw)
--- ID DA FROTA DE ORIGEM : 'guilherme-hu'
--- -----------------------------------------------------------------------------
-
--- =============================================================================
 -- 1) FUNÇÕES E PROCEDURES GLOBAIS DO DW (Utilitários Compartilhados)
--- =============================================================================
 
 DROP FUNCTION IF EXISTS dw.fn_sk_tempo;
 DELIMITER //
@@ -57,9 +47,7 @@ BEGIN
 END//
 DELIMITER ;
 
--- =============================================================================
 -- 2) PROCEDURES DE CARGA — DIMENSÕES
--- =============================================================================
 
 -- 2.1) Endereço
 DROP PROCEDURE IF EXISTS dw.sp_guilherme_hu_carga_dim_endereco;
@@ -172,9 +160,7 @@ BEGIN
 END//
 DELIMITER ;
 
--- =============================================================================
 -- 3) PROCEDURES DE CARGA — FATOS
--- =============================================================================
 
 -- 3.1) Fato: Inventário de Pátio
 DROP PROCEDURE IF EXISTS dw.sp_guilherme_hu_carga_fato_inventario_patio;
@@ -388,9 +374,8 @@ BEGIN
 END//
 DELIMITER ;
 
--- =============================================================================
+
 -- 4) PROCEDURE MAIN DE CARGA
--- =============================================================================
 DROP PROCEDURE IF EXISTS dw.sp_guilherme_hu_carga_completa;
 DELIMITER //
 CREATE PROCEDURE dw.sp_guilherme_hu_carga_completa()
@@ -406,16 +391,3 @@ BEGIN
     CALL dw.sp_guilherme_hu_carga_fato_reserva();
 END//
 DELIMITER ;
-
--- =============================================================================
--- 5) EXEMPLO DE EXECUÇÃO
--- =============================================================================
-/*
-  -- Carga full (Primeira vez para a frota guilherme-hu):
-  CALL staging.sp_guilherme_hu_extracao_completa(TRUE);
-  CALL staging.sp_guilherme_hu_transformacao_completa();
-  CALL dw.sp_guilherme_hu_carga_completa();
-
-  -- Se for usar de forma orquestrada/agendada, apenas chamar:
-  CALL dw.sp_guilherme_hu_carga_completa();
-*/
