@@ -4,39 +4,13 @@
 -- Giovanni Faletti Almeida (123184214)
 -- Guilherme En Shih Hu (123224674)
 -- Maria Victoria França Silva Ramos (123311073)
--- ============================================================================
--- ETL valviessejoao - TRANSFORMACAO (o "T")
--- Entrada : staging.stg_valviessejoao_*  (cru, gerado pelo 01_extracao)
--- Saida   : staging.stg_conf_*           (conformado COMPARTILHADO do consorcio)
--- Rejeitos: staging.stg_rejeitos_etl
--- SGBD    : MySQL 8.x
---
--- Ordem de execucao do projeto:
---   DW.sql  ->  etl_valviessejoao_extracao  ->  etl_valviessejoao_transformacao
---           ->  etl_valviessejoao_carga
---
--- Convencoes do consorcio (espelha gui-hu / p-rique):
---   * nk_frota_origem = 'valviessejoao' (handle do github; carimbado aqui).
---   * As tabelas stg_conf_* sao COMPARTILHADAS por todas as frotas; por isso
---     cada procedure apaga SO as suas linhas (WHERE nk_frota_origem=...) antes
---     de reinserir, e usa CREATE TABLE IF NOT EXISTS (nao recria se ja existir).
---   * Mapeia o esquema da fonte (id_*, cidade/estado, data_hora_*) para o
---     contrato conformado (nk_*, end_cidade/end_uf/end_pais, data_*).
---   * Padroniza para respeitar os CHECKs do DW (tipo_cliente PF/PJ; mecanizacao
---     MANUAL/AUTOMATICO/NAO INFORMADO; status_reserva ATIVA/CANCELADA/CONVERTIDA;
---     duracao>=1; valores>=0).
---
--- Dois mecanismos (idempotentes, coexistem):
---   (A) Procedures sp_valviessejoao_transforma_*  -> conformacao em LOTE.
---   (B) TRIGGERS sobre staging.stg_valviessejoao_* -> conformacao incremental.
--- ============================================================================
+
 
 CREATE SCHEMA IF NOT EXISTS staging;
 
--- ============================================================================
 -- 1) TABELAS DE REJEITOS E CONFORMADAS (compartilhadas) - garantia de existencia
 --    DDL identica a usada por gui-hu / p-rique (contrato unico do consorcio).
--- ============================================================================
+
 
 CREATE TABLE IF NOT EXISTS staging.stg_rejeitos_etl (
     id_rejeito      INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -131,14 +105,9 @@ CREATE TABLE IF NOT EXISTS staging.stg_conf_snapshot_patio (
     PRIMARY KEY (nk_frota_origem, nk_id_patio, nk_id_veiculo, data_snapshot)
 );
 
--- ============================================================================
 -- 2) PROCEDURES DE TRANSFORMACAO (conformacao em LOTE / backfill)
--- ============================================================================
 
 -- ---- 2.1) Patio -------------------------------------------------------------
--- A fonte valviessejoao NAO possui capacidade de vagas nem cidade/UF do patio
--- (apenas 'localizacao' livre); por isso capacidade = -1 (sentinela) e endereco
--- = NAO INFORMADO/XX/Brasil.
 DROP PROCEDURE IF EXISTS staging.sp_valviessejoao_transforma_patio;
 DELIMITER //
 CREATE PROCEDURE staging.sp_valviessejoao_transforma_patio()
@@ -373,9 +342,7 @@ BEGIN
 END//
 DELIMITER ;
 
--- ============================================================================
 -- 3) VIEW DE MONITORAMENTO DE QUALIDADE (rejeitos desta frota)
--- ============================================================================
 CREATE OR REPLACE VIEW staging.vw_valviessejoao_qualidade_etl AS
 SELECT
     tabela_origem,
@@ -388,11 +355,8 @@ WHERE nk_frota_origem = 'valviessejoao'
 GROUP BY tabela_origem
 ORDER BY total_rejeitos DESC;
 
--- ============================================================================
 -- 4) TRIGGERS DE TRANSFORMACAO INCREMENTAL (CDC sobre o staging cru)
---    Conformam linha a linha cada INSERT/UPDATE feito pela extracao (01) nas
---    tabelas staging.stg_valviessejoao_*. Mesma logica das procedures, em UPSERT.
--- ============================================================================
+
 DELIMITER //
 
 -- ----------------------------- PATIO ----------------------------------------
@@ -690,10 +654,6 @@ END//
 
 DELIMITER ;
 
--- ============================================================================
--- 5) TRANSFORMACAO INICIAL EM LOTE (executar uma vez, apos a carga do 01).
---    Depois disso, os TRIGGERS acima mantem staging.stg_conf_* atualizado.
--- ============================================================================
 CALL staging.sp_valviessejoao_transformacao_completa();
 
--- FIM DO SCRIPT DE TRANSFORMACAO (valviessejoao)
+
