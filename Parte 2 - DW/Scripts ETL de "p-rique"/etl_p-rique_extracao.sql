@@ -5,36 +5,12 @@
 -- Guilherme En Shih Hu (123224674)
 -- Maria Victoria França Silva Ramos (123311073)
 
-
--- =============================================================================
--- etl_p-rique_extracao.sql
--- Extração ETL — OLTP Amarelo (locadora_amarelo) → Área de Staging
---
--- Frota de origem : 'p-rique'
--- Banco fonte     : locadora_amarelo
--- Banco staging   : staging  (mesmo schema usado pelo gupessanha)
---
--- Estratégia de extração:
---   • Todas as entidades usam carga full (TRUNCATE + INSERT), pois o OLTP
---     Amarelo não possui colunas de controle de alteração (updated_at).
---   • Os campos dt_extracao registram o momento da execução para auditoria.
---   • O campo nk_frota_origem = 'p-rique' identifica esta fonte no DW.
---
--- Mapeamento OLTP Amarelo → conceitos do DW:
---   Categoria  → Grupo
---   Vaga/Patio → localização física do veículo
---   Endereco   → desnormalizado em staging (cidade, UF, logradouro)
--- =============================================================================
-
-
 -- Marca o momento desta extração para uso nos metadados
 SET @extracao_ts = NOW();
 
 
--- =========================================================================
---  1) STAGING: Criação das tabelas (caso ainda não existam)
--- =========================================================================
 
+--  1) STAGING: Criação das tabelas (caso ainda não existam)
 CREATE SCHEMA IF NOT EXISTS staging;
 
 --  1.1) stg_prique_patio
@@ -165,9 +141,8 @@ CREATE TABLE IF NOT EXISTS staging.stg_prique_snapshot_patio (
 
 
 
--- =========================================================================
+
 --  2) PROCEDURES DE EXTRAÇÃO
--- =========================================================================
 
 --  2.1) sp_prique_extrai_patio
 --       Carga full. JOIN com Endereco para obter dados de localização.
@@ -502,10 +477,8 @@ BEGIN
 END//
 
 
--- =========================================================================
 --  3) PROCEDURE MAIN DE EXTRAÇÃO
 --     Chama todas as extrações na ordem correta (dimensões antes de fatos).
--- =========================================================================
 
 DROP PROCEDURE IF EXISTS staging.sp_prique_extracao_completa//
 CREATE PROCEDURE staging.sp_prique_extracao_completa()
@@ -525,19 +498,8 @@ END//
 DELIMITER ;
 
 
--- =========================================================================
+
 --  4) TRIGGERS DE EXTRAÇÃO (Event-Driven)
---     Substituem as procedures de extração para operação em tempo real.
---     Cada INSERT/UPDATE no OLTP Amarelo replica no staging bruto.
---
---     NOTA: As procedures batch (seção 2 e 3) são mantidas para:
---       - Carga inicial (full load)
---       - Re-execução manual / recuperação
---     As triggers abaixo funcionam para operação contínua.
---
---     NOTA 2: O snapshot de pátio (stg_prique_snapshot_patio) NÃO é coberto
---     por triggers — continua como procedure agendada diariamente.
--- =========================================================================
 
 DELIMITER //
 
