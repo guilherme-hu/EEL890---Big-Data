@@ -5,45 +5,7 @@
 -- Guilherme En Shih Hu (123224674)
 -- Maria Victoria França Silva Ramos (123311073)
 
-
--- =============================================================================
--- etl_p-rique_transformacao.sql
--- Transformação ETL — Staging Bruto (p-rique) → Staging Conformado
---
--- Execução: após etl_p-rique_extracao.sql, antes de etl_p-rique_carga.sql
--- Banco: staging
---
--- IMPORTANTE: As tabelas conformadas (stg_conf_*) e a tabela de rejeitos
--- (stg_rejeitos_etl) já foram criadas pelo script de transformação do
--- gupessanha. Este script apenas cria as procedures de transformação do
--- p-rique, que populam as mesmas tabelas conformadas com
--- nk_frota_origem = 'p-rique'.
---
--- ORDEM DE EXECUÇÃO: Este script deve rodar APÓS a transformação do
--- gupessanha, pois o gupessanha faz TRUNCATE nas tabelas stg_conf_*.
--- O p-rique usa DELETE seletivo (WHERE nk_frota_origem = 'p-rique')
--- para preservar os dados do gupessanha.
---
--- Legenda das Transformações realizadas:
---   T1  Normalização de frota_origem: garantir 'p-rique' em todos registros
---   T2  Tratamento de endereços incompletos (clientes e pátios)
---   T3  Conformação de tipo_cliente: 'PF'/'PJ' → vocabulário DW
---   T4  Conformação de mecanizacao: tipo_cambio Amarelo → DW
---   T5  Normalização de nome/razão social (trim, upper)
---   T6  Mapeamento de status de reserva → Dd_status_reserva do DW
---   T7  Cálculo de duracao_prevista e valor_previsto_reserva
---   T8  Cálculo/validação de valor_final da locação
---   T9  Validação de datas: rejeita registros inconsistentes
---   T10 Tratamento de NULLs críticos (substitui por sentinelas)
---   T11 Tratamento de capacidade de pátio nula (sentinela -1)
--- =============================================================================
-
-
-
--- =========================================================================
 --  2) PROCEDURES DE TRANSFORMAÇÃO
--- =========================================================================
-
 --  2.1) sp_prique_transforma_patio
 --       T2  Endereços incompletos: concatena logradouro + cidade + UF
 --       T11 Capacidade nula → -1 (sentinela "desconhecida")
@@ -128,13 +90,6 @@ END//
 
 
 --  2.3) sp_prique_transforma_veiculo
---       T4  Conformação mecanizacao (tipo_cambio Amarelo → MANUAL/AUTOMATICO)
---       T10 Campos obrigatórios nulos → sentinelas
---
---       Nota: No OLTP Amarelo, o pátio de origem é derivado de Vaga→Patio e
---       pode ser NULL quando o veículo está em locação. Veículos sem pátio de
---       origem recebem sentinela 0 para não serem rejeitados, já que
---       nk_id_patio_origem NÃO é utilizado na dim_veiculo do DW.
 DROP PROCEDURE IF EXISTS staging.sp_prique_transforma_veiculo//
 CREATE PROCEDURE staging.sp_prique_transforma_veiculo()
 BEGIN
@@ -538,12 +493,10 @@ END//
 DELIMITER ;
 
 
--- =========================================================================
 --  4) TRIGGERS DE TRANSFORMAÇÃO (Event-Driven)
 --     Substituem as procedures de transformação para operação em tempo real.
 --     Cada INSERT/UPDATE no staging bruto (stg_prique_*) dispara a
 --     transformação e grava no staging conformado (stg_conf_*).
--- =========================================================================
 
 DELIMITER //
 
