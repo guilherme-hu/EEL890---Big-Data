@@ -4,45 +4,15 @@
 -- Giovanni Faletti Almeida (123184214)
 -- Guilherme En Shih Hu (123224674)
 -- Maria Victoria França Silva Ramos (123311073)
--- ----------------------------------------------------------------------------
--- Arquivo : 02_transformacao_NOVOOK.sql
--- Etapa   : TRANSFORMACAO  (o "T" do ETL)
--- Entrada : Area de STAGING crua (dw_staging.stg_*)  -- gerada pelo script 01
--- Saida   : Area de STAGING conformada (dw_staging.trf_*) -- pronta p/ a Carga
--- SGBD    : MySQL 8.x
---
--- O que esta etapa faz (integrar e conformar as fontes):
---   1. CARIMBA a frota de origem  -> nk_frota_origem = 'NOVOOK' (compoe a NK).
---   2. LIMPA/PADRONIZA texto (TRIM/UPPER), trata vazios e enderecos incompletos.
---   3. RESOLVE lacunas do modelo de origem:
---        - pais: a fonte NOVOOK nao tem -> assume 'BRASIL'.
---        - capacidade do patio: a fonte nao tem -> NULL (Dim_Patio).
---        - grupo da locacao: ja veio enriquecido de VEICULO no script 01.
---   4. CALCULA medidas derivadas:
---        - Fato_Reserva.duracao_prevista_dias  = DATEDIFF(prev_dev, prev_ret)
---        - Fato_Reserva.valor_previsto_reserva = duracao * diaria_do_grupo
---   5. CONFORMA datas (TIMESTAMP -> DATE) para casar com a Dim_Tempo.
---
--- Mecanismos (conforme pedido, ha TRIGGERS tambem nesta etapa):
---   (A) Procedures sp_transforma_* -> transformacao em LOTE (carga inicial /
---       reprocessamento completo).
---   (B) TRIGGERS nas tabelas stg_* -> transformam linha a linha cada registro
---       que a EXTRACAO insere/atualiza no staging (transformacao incremental).
---   Ambos sao IDEMPOTENTES (UPSERT), portanto coexistem sem conflito.
--- ============================================================================
+
 
 USE dw_staging;
 
--- ============================================================================
--- 0) FUNCOES AUXILIARES (mantem a logica de conformacao em UM lugar so)
--- ============================================================================
 DROP FUNCTION IF EXISTS fn_frota_origem;
 DROP FUNCTION IF EXISTS fn_txt_norm;
 
 DELIMITER $$
 
--- Frota de origem desta fonte. Para reaproveitar o script em outra fonte,
--- basta trocar 'NOVOOK' aqui (GOAT / IA / AMARELO / NOVOOK).
 CREATE FUNCTION fn_frota_origem() RETURNS VARCHAR(100)
 DETERMINISTIC NO SQL
 RETURN 'NOVOOK'$$
@@ -54,11 +24,9 @@ RETURN NULLIF(TRIM(UPPER(p)), '')$$
 
 DELIMITER ;
 
--- ============================================================================
 -- 1) TABELAS CONFORMADAS (trf_*)  -- espelham as colunas do DW (sem as SKs,
 --    que so sao geradas na Carga). Guardam as CHAVES NATURAIS (nk_*) para a
 --    Carga resolver as Surrogate Keys por JOIN.
--- ============================================================================
 
 DROP TABLE IF EXISTS trf_fato_inventario_patio;
 DROP TABLE IF EXISTS trf_fato_reserva;
@@ -165,9 +133,7 @@ CREATE TABLE trf_fato_inventario_patio (
     PRIMARY KEY (nk_frota_origem, dt_referencia, nk_id_veiculo)
 ) ENGINE=InnoDB;
 
--- ============================================================================
 -- 2) TRANSFORMACAO EM LOTE (procedures)
--- ============================================================================
 
 DROP PROCEDURE IF EXISTS sp_transforma_dimensoes;
 DROP PROCEDURE IF EXISTS sp_transforma_locacoes;
@@ -325,12 +291,10 @@ END$$
 
 DELIMITER ;
 
--- ============================================================================
 -- 3) TRANSFORMACAO INCREMENTAL (TRIGGERS sobre o staging cru)
 --    Cada vez que a EXTRACAO grava em stg_*, estes triggers conformam a linha
 --    e fazem UPSERT em trf_*. Assim o "T" acontece junto do "E", em tempo real.
 --    (Mesma logica das procedures, porem linha a linha.)
--- ============================================================================
 
 DROP TRIGGER IF EXISTS trg_trf_cliente_ai;
 DROP TRIGGER IF EXISTS trg_trf_cliente_au;
@@ -571,10 +535,8 @@ ON DUPLICATE KEY UPDATE
 
 DELIMITER ;
 
--- ============================================================================
+
 -- 4) TRANSFORMACAO INICIAL EM LOTE (executar uma vez, apos a carga inicial do
 --    script 01). Depois disso, os TRIGGERS acima mantem trf_* atualizado.
--- ============================================================================
 CALL sp_transforma_tudo();
 
--- FIM DO SCRIPT DE TRANSFORMACAO (NOVOOK)
