@@ -4,25 +4,8 @@
 -- Giovanni Faletti Almeida (123184214)
 -- Guilherme En Shih Hu (123224674)
 -- Maria Victoria França Silva Ramos (123311073)
--- ============================================================================
--- ETL valviessejoao - CARGA (o "L"/Load)
--- Entrada : staging.stg_conf_*   (conformado COMPARTILHADO; gerado pelo 02)
--- Saida   : dw.*                 (esquema estrela CENTRAL, criado por DW.sql)
--- Rejeitos: staging.stg_rejeitos_etl
--- SGBD    : MySQL 8.x
---
--- Pre-requisito: rodar DW.sql ANTES (cria o schema `dw`, as dim_/fato_ e
--- pre-popula dim_tempo 2015-2035). Esta carga NAO cria o esquema do DW; apenas
--- popula via procedures sp_valviessejoao_carga_* (UPSERT = SCD1), igual gui-hu/
--- p-rique. Resolve as Surrogate Keys por JOIN nas dimensoes pela Chave Natural
--- (nk_frota_origem + nk_id_*). Linhas cujas SKs nao resolvem viram rejeitos
--- (qualidade de dados) em vez de quebrar a carga.
--- ============================================================================
 
--- ============================================================================
 -- 1) UTILITARIOS COMPARTILHADOS DO DW (data -> sk_tempo; garante dim_tempo)
---    Definidos de forma idempotente; identicos entre as frotas do consorcio.
--- ============================================================================
 
 -- 1.1) Lookup data -> sk_tempo (a dim_tempo ja vem pre-populada pelo DW.sql)
 DROP FUNCTION IF EXISTS dw.fn_sk_tempo;
@@ -60,9 +43,8 @@ BEGIN
 END//
 DELIMITER ;
 
--- ============================================================================
+
 -- 2) CARGA DAS DIMENSOES (gera/atualiza SKs por UPSERT na Chave Natural)
--- ============================================================================
 
 -- 2.1) Dim_Endereco (cidade/UF/pais distintos vindos de patio e cliente)
 DROP PROCEDURE IF EXISTS dw.sp_valviessejoao_carga_dim_endereco;
@@ -153,11 +135,7 @@ BEGIN
 END//
 DELIMITER ;
 
--- ============================================================================
 -- 3) CARGA DOS FATOS (garante datas na dim_tempo, registra rejeitos de FK e
---    resolve TODAS as SKs por JOIN). INNER JOIN nas dimensoes obrigatorias:
---    se uma SK nao resolve, a linha vira rejeito em vez de quebrar a carga.
--- ============================================================================
 
 -- 3.1) Fato_Inventario_Patio (sk_grupo é NOT NULL no DW -> JOIN obrigatorio)
 DROP PROCEDURE IF EXISTS dw.sp_valviessejoao_carga_fato_inventario_patio;
@@ -345,9 +323,7 @@ BEGIN
 END//
 DELIMITER ;
 
--- ============================================================================
 -- 4) ORQUESTRADOR DA CARGA COMPLETA (dimensoes antes; fatos depois)
--- ============================================================================
 DROP PROCEDURE IF EXISTS dw.sp_valviessejoao_carga_completa;
 DELIMITER //
 CREATE PROCEDURE dw.sp_valviessejoao_carga_completa()
@@ -364,9 +340,9 @@ BEGIN
 END//
 DELIMITER ;
 
--- ============================================================================
+
 -- 5) EXECUCAO DA CARGA
--- ============================================================================
+
 CALL dw.sp_valviessejoao_carga_completa();
 
--- FIM DO SCRIPT DE CARGA (valviessejoao)
+
