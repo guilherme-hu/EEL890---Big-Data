@@ -546,8 +546,8 @@ AFTER INSERT ON staging.stg_prique_grupo
 FOR EACH ROW
 BEGIN
     IF NEW.valor_diaria IS NULL OR NEW.valor_diaria = 0 THEN
-        INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
-        VALUES ('stg_prique_grupo', NEW.nk_frota_origem, NEW.nk_id_grupo, 'Grupo sem valor_diaria vigente; será carregado com valor 0,00');
+        INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
+        VALUES ('stg_prique_grupo', NEW.nk_frota_origem, NEW.nk_id_grupo, 'Grupo sem valor_diaria vigente; será carregado com valor 0,00', JSON_OBJECT('nk_id_grupo', NEW.nk_id_grupo, 'valor_diaria', NEW.valor_diaria));
     END IF;
 
     INSERT INTO staging.stg_conf_grupo (
@@ -582,8 +582,8 @@ AFTER INSERT ON staging.stg_prique_veiculo
 FOR EACH ROW
 BEGIN
     IF NEW.nk_id_grupo IS NULL THEN
-        INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
-        VALUES ('stg_prique_veiculo', NEW.nk_frota_origem, NEW.nk_id_veiculo, 'Veículo sem nk_id_grupo');
+        INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
+        VALUES ('stg_prique_veiculo', NEW.nk_frota_origem, NEW.nk_id_veiculo, 'Veículo sem nk_id_grupo', JSON_OBJECT('nk_id_veiculo', NEW.nk_id_veiculo, 'nk_id_grupo', NEW.nk_id_grupo));
     ELSE
         INSERT INTO staging.stg_conf_veiculo (
             nk_frota_origem, nk_id_veiculo, nk_id_grupo, nk_id_patio_origem,
@@ -632,8 +632,8 @@ AFTER INSERT ON staging.stg_prique_cliente
 FOR EACH ROW
 BEGIN
     IF NEW.tipo_cliente NOT IN ('PF', 'PJ') THEN
-        INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
-        VALUES ('stg_prique_cliente', NEW.nk_frota_origem, NEW.nk_id_cliente, 'Cliente sem tipo_cliente (PF/PJ)');
+        INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
+        VALUES ('stg_prique_cliente', NEW.nk_frota_origem, NEW.nk_id_cliente, 'Cliente sem tipo_cliente (PF/PJ)', JSON_OBJECT('nk_id_cliente', NEW.nk_id_cliente, 'tipo_cliente', NEW.tipo_cliente));
     ELSE
         INSERT INTO staging.stg_conf_cliente (
             nk_frota_origem, nk_id_cliente, tipo_cliente, nome, end_cidade, end_uf, end_pais
@@ -674,8 +674,21 @@ AFTER INSERT ON staging.stg_prique_reserva
 FOR EACH ROW
 BEGIN
     IF NEW.nk_id_cliente IS NULL OR NEW.nk_id_grupo IS NULL OR NEW.nk_id_patio_retirada IS NULL OR NEW.nk_id_patio_fim IS NULL OR NEW.data_reserva IS NULL OR NEW.data_retirada_prevista IS NULL OR NEW.data_devolucao_prevista IS NULL OR NEW.data_devolucao_prevista <= NEW.data_retirada_prevista OR COALESCE(NEW.duracao_prevista_dias, 0) < 1 THEN
-        INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
-        VALUES ('stg_prique_reserva', NEW.nk_frota_origem, NEW.nk_id_reserva, 'Reserva inválida');
+        INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
+        VALUES ('stg_prique_reserva', NEW.nk_frota_origem, NEW.nk_id_reserva,
+            CASE
+                WHEN NEW.nk_id_cliente IS NULL            THEN 'Reserva sem cliente'
+                WHEN NEW.nk_id_grupo IS NULL              THEN 'Reserva sem grupo'
+                WHEN NEW.nk_id_patio_retirada IS NULL     THEN 'Reserva sem pátio de retirada'
+                WHEN NEW.nk_id_patio_fim IS NULL          THEN 'Reserva sem pátio de fim'
+                WHEN NEW.data_reserva IS NULL             THEN 'Reserva sem data de reserva'
+                WHEN NEW.data_retirada_prevista IS NULL   THEN 'Reserva sem data de retirada prevista'
+                WHEN NEW.data_devolucao_prevista IS NULL  THEN 'Reserva sem data de devolução prevista'
+                WHEN NEW.data_devolucao_prevista <= NEW.data_retirada_prevista THEN 'Data devolução <= data retirada'
+                WHEN COALESCE(NEW.duracao_prevista_dias, 0) < 1 THEN 'Duração prevista inválida (< 1 dia)'
+                ELSE 'Erro desconhecido'
+            END,
+            JSON_OBJECT('nk_id_reserva', NEW.nk_id_reserva, 'nk_id_cliente', NEW.nk_id_cliente, 'nk_id_grupo', NEW.nk_id_grupo, 'nk_id_patio_retirada', NEW.nk_id_patio_retirada, 'nk_id_patio_fim', NEW.nk_id_patio_fim, 'data_reserva', NEW.data_reserva, 'data_retirada_prevista', NEW.data_retirada_prevista, 'data_devolucao_prevista', NEW.data_devolucao_prevista, 'duracao_prevista_dias', NEW.duracao_prevista_dias, 'status_reserva', NEW.status_reserva));
     ELSE
         INSERT INTO staging.stg_conf_reserva (
             nk_frota_origem, nk_id_reserva, nk_id_cliente, nk_id_grupo, nk_id_patio_retirada, nk_id_patio_fim,
@@ -718,8 +731,19 @@ AFTER INSERT ON staging.stg_prique_locacao
 FOR EACH ROW
 BEGIN
     IF NEW.nk_id_cliente IS NULL OR NEW.nk_id_veiculo IS NULL OR NEW.nk_id_grupo IS NULL OR NEW.nk_id_patio_retirada IS NULL OR NEW.data_retirada IS NULL OR NEW.data_prev_devolucao IS NULL OR (NEW.data_real_devolucao IS NOT NULL AND NEW.data_real_devolucao < NEW.data_retirada) THEN
-        INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
-        VALUES ('stg_prique_locacao', NEW.nk_frota_origem, NEW.nk_id_locacao, 'Locação inválida');
+        INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
+        VALUES ('stg_prique_locacao', NEW.nk_frota_origem, NEW.nk_id_locacao,
+            CASE
+                WHEN NEW.nk_id_cliente IS NULL         THEN 'Locação sem cliente'
+                WHEN NEW.nk_id_veiculo IS NULL         THEN 'Locação sem veículo'
+                WHEN NEW.nk_id_grupo IS NULL           THEN 'Locação sem grupo'
+                WHEN NEW.nk_id_patio_retirada IS NULL  THEN 'Locação sem pátio de retirada'
+                WHEN NEW.data_retirada IS NULL         THEN 'Locação sem data de retirada'
+                WHEN NEW.data_prev_devolucao IS NULL   THEN 'Locação sem data prev. devolução'
+                WHEN NEW.data_real_devolucao IS NOT NULL AND NEW.data_real_devolucao < NEW.data_retirada THEN 'Data devolução real anterior à retirada'
+                ELSE 'Erro desconhecido'
+            END,
+            JSON_OBJECT('nk_id_locacao', NEW.nk_id_locacao, 'nk_id_cliente', NEW.nk_id_cliente, 'nk_id_veiculo', NEW.nk_id_veiculo, 'nk_id_grupo', NEW.nk_id_grupo, 'nk_id_patio_retirada', NEW.nk_id_patio_retirada, 'data_retirada', NEW.data_retirada, 'data_prev_devolucao', NEW.data_prev_devolucao, 'data_real_devolucao', NEW.data_real_devolucao, 'valor_final', NEW.valor_final));
     ELSE
         INSERT INTO staging.stg_conf_locacao (
             nk_frota_origem, nk_id_locacao, nk_id_cliente, nk_id_veiculo, nk_id_grupo, nk_id_patio_retirada, nk_id_patio_devolucao,

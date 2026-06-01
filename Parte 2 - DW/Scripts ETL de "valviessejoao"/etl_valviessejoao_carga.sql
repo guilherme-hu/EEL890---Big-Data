@@ -261,6 +261,41 @@ BEGIN
     -- se alguma SK nao resolver (problema de qualidade de dado), a linha e
     -- descartada em vez de quebrar a carga. Devolucao usa LEFT JOIN (pode ser
     -- NULL enquanto o carro nao volta).
+    -- Registra rejeitos: FKs que não resolvem para SK
+    INSERT IGNORE INTO staging.stg_rejeitos_etl
+        (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+    SELECT
+        'trf_fato_locacao', f.nk_frota_origem, f.nk_id_locacao,
+        CASE
+            WHEN fn_sk_tempo(f.dt_retirada) IS NULL THEN
+                CONCAT('DATA RETIRADA NÃO EM DIM_TEMPO: ', CAST(f.dt_retirada AS CHAR))
+            WHEN dc.sk_cliente IS NULL THEN
+                CONCAT('CLIENTE NÃO EM DIM_CLIENTE: nk=', CAST(f.nk_id_cliente AS CHAR))
+            WHEN dv.sk_veiculo IS NULL THEN
+                CONCAT('VEÍCULO NÃO EM DIM_VEICULO: nk=', CAST(f.nk_id_veiculo AS CHAR))
+            WHEN dg.sk_grupo IS NULL THEN
+                CONCAT('GRUPO NÃO EM DIM_GRUPO: nk=', CAST(f.nk_id_grupo AS CHAR))
+            WHEN dpr.sk_patio IS NULL THEN
+                CONCAT('PÁTIO RETIRADA NÃO EM DIM_PATIO: nk=', CAST(f.nk_id_patio_retirada AS CHAR))
+            WHEN f.nk_id_patio_devol_real IS NOT NULL AND dpd.sk_patio IS NULL THEN
+                CONCAT('PÁTIO DEVOLUÇÃO NÃO EM DIM_PATIO: nk=', CAST(f.nk_id_patio_devol_real AS CHAR))
+        END
+    FROM dw_staging.trf_fato_locacao f
+    LEFT JOIN dim_cliente dc ON dc.nk_frota_origem = f.nk_frota_origem AND dc.nk_id_cliente = f.nk_id_cliente
+    LEFT JOIN dim_veiculo dv ON dv.nk_frota_origem = f.nk_frota_origem AND dv.nk_id_veiculo = f.nk_id_veiculo
+    LEFT JOIN dim_grupo dg ON dg.nk_frota_origem = f.nk_frota_origem AND dg.nk_id_grupo = f.nk_id_grupo
+    LEFT JOIN dim_patio dpr ON dpr.nk_frota_origem = f.nk_frota_origem AND dpr.nk_id_patio = f.nk_id_patio_retirada
+    LEFT JOIN dim_patio dpd ON dpd.nk_frota_origem = f.nk_frota_origem AND dpd.nk_id_patio = f.nk_id_patio_devol_real
+    WHERE f.nk_frota_origem = 'NOVOOK'
+      AND (
+            fn_sk_tempo(f.dt_retirada) IS NULL
+         OR dc.sk_cliente IS NULL
+         OR dv.sk_veiculo IS NULL
+         OR dg.sk_grupo IS NULL
+         OR dpr.sk_patio IS NULL
+         OR (f.nk_id_patio_devol_real IS NOT NULL AND dpd.sk_patio IS NULL)
+      );
+
     INSERT INTO fato_locacao
         (nk_frota_origem, nk_id_locacao, sk_tempo_retirada, sk_tempo_prev_devolucao,
          sk_tempo_real_devolucao, sk_cliente, sk_veiculo, sk_grupo, sk_patio_retirada,
@@ -288,6 +323,36 @@ BEGIN
         valor_final             = VALUES(valor_final);
 
     -- ---------------------- Fato_Reserva -----------------------------------
+    INSERT IGNORE INTO staging.stg_rejeitos_etl
+        (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+    SELECT
+        'trf_fato_reserva', f.nk_frota_origem, f.nk_id_reserva,
+        CASE
+            WHEN fn_sk_tempo(f.dt_reserva) IS NULL THEN
+                CONCAT('DATA RESERVA NÃO EM DIM_TEMPO: ', CAST(f.dt_reserva AS CHAR))
+            WHEN dc.sk_cliente IS NULL THEN
+                CONCAT('CLIENTE NÃO EM DIM_CLIENTE: nk=', CAST(f.nk_id_cliente AS CHAR))
+            WHEN dg.sk_grupo IS NULL THEN
+                CONCAT('GRUPO NÃO EM DIM_GRUPO: nk=', CAST(f.nk_id_grupo AS CHAR))
+            WHEN dpr.sk_patio IS NULL THEN
+                CONCAT('PÁTIO RETIRADA NÃO EM DIM_PATIO: nk=', CAST(f.nk_id_patio_retirada AS CHAR))
+            WHEN dpf.sk_patio IS NULL THEN
+                CONCAT('PÁTIO FIM NÃO EM DIM_PATIO: nk=', CAST(f.nk_id_patio_fim AS CHAR))
+        END
+    FROM dw_staging.trf_fato_reserva f
+    LEFT JOIN dim_cliente dc ON dc.nk_frota_origem = f.nk_frota_origem AND dc.nk_id_cliente = f.nk_id_cliente
+    LEFT JOIN dim_grupo dg ON dg.nk_frota_origem = f.nk_frota_origem AND dg.nk_id_grupo = f.nk_id_grupo
+    LEFT JOIN dim_patio dpr ON dpr.nk_frota_origem = f.nk_frota_origem AND dpr.nk_id_patio = f.nk_id_patio_retirada
+    LEFT JOIN dim_patio dpf ON dpf.nk_frota_origem = f.nk_frota_origem AND dpf.nk_id_patio = f.nk_id_patio_fim
+    WHERE f.nk_frota_origem = 'NOVOOK'
+      AND (
+            fn_sk_tempo(f.dt_reserva) IS NULL
+         OR dc.sk_cliente IS NULL
+         OR dg.sk_grupo IS NULL
+         OR dpr.sk_patio IS NULL
+         OR dpf.sk_patio IS NULL
+      );
+
     INSERT INTO fato_reserva
         (nk_frota_origem, nk_id_reserva, sk_tempo_reserva, sk_tempo_prev_retirada,
          sk_tempo_prev_devolucao, sk_cliente, sk_grupo, sk_patio_retirada, sk_patio_fim,
@@ -315,6 +380,32 @@ BEGIN
         dd_status_reserva       = VALUES(dd_status_reserva);
 
     -- ------------------- Fato_Inventario_Patio -----------------------------
+    INSERT IGNORE INTO staging.stg_rejeitos_etl
+        (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+    SELECT
+        'trf_fato_inventario_patio', f.nk_frota_origem, f.nk_id_veiculo,
+        CASE
+            WHEN fn_sk_tempo(f.dt_referencia) IS NULL THEN
+                CONCAT('DATA NÃO ENCONTRADA EM DIM_TEMPO: ', CAST(f.dt_referencia AS CHAR))
+            WHEN dp.sk_patio IS NULL THEN
+                CONCAT('PÁTIO NÃO ENCONTRADO EM DIM_PATIO: nk=', CAST(f.nk_id_patio AS CHAR))
+            WHEN dv.sk_veiculo IS NULL THEN
+                CONCAT('VEÍCULO NÃO ENCONTRADO EM DIM_VEICULO: nk=', CAST(f.nk_id_veiculo AS CHAR))
+            WHEN dg.sk_grupo IS NULL THEN
+                CONCAT('GRUPO NÃO ENCONTRADO EM DIM_GRUPO: nk=', CAST(f.nk_id_grupo AS CHAR))
+        END
+    FROM dw_staging.trf_fato_inventario_patio f
+    LEFT JOIN dim_patio dp ON dp.nk_frota_origem = f.nk_frota_origem AND dp.nk_id_patio = f.nk_id_patio
+    LEFT JOIN dim_veiculo dv ON dv.nk_frota_origem = f.nk_frota_origem AND dv.nk_id_veiculo = f.nk_id_veiculo
+    LEFT JOIN dim_grupo dg ON dg.nk_frota_origem = f.nk_frota_origem AND dg.nk_id_grupo = f.nk_id_grupo
+    WHERE f.nk_frota_origem = 'NOVOOK'
+      AND (
+            fn_sk_tempo(f.dt_referencia) IS NULL
+         OR dp.sk_patio IS NULL
+         OR dv.sk_veiculo IS NULL
+         OR dg.sk_grupo IS NULL
+      );
+
     INSERT INTO fato_inventario_patio
         (sk_tempo_referencia, sk_patio, sk_veiculo, sk_grupo, qtde_veiculos_presentes)
     SELECT fn_sk_tempo(f.dt_referencia), dp.sk_patio, dv.sk_veiculo, dg.sk_grupo, 1

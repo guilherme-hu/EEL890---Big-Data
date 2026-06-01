@@ -26,7 +26,20 @@ DELIMITER ;
 
 -- 1) TABELAS CONFORMADAS (trf_*)  -- espelham as colunas do DW (sem as SKs,
 --    que so sao geradas na Carga). Guardam as CHAVES NATURAIS (nk_*) para a
+--    que so sao geradas na Carga). Guardam as CHAVES NATURAIS (nk_*) para a
 --    Carga resolver as Surrogate Keys por JOIN.
+
+CREATE SCHEMA IF NOT EXISTS staging;
+
+CREATE TABLE IF NOT EXISTS staging.stg_rejeitos_etl (
+    id_rejeito      INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    tabela_origem   VARCHAR(60)  NOT NULL,
+    nk_frota_origem VARCHAR(20)  NOT NULL,
+    nk_id_registro  INT          NOT NULL,
+    motivo_rejeito  VARCHAR(255) NOT NULL,
+    dados_json      JSON,
+    dt_rejeito      DATETIME     NOT NULL DEFAULT NOW()
+);
 
 DROP TABLE IF EXISTS trf_fato_inventario_patio;
 DROP TABLE IF EXISTS trf_fato_reserva;
@@ -209,6 +222,22 @@ END$$
 -- ---- 2.2) Fato_Locacao -------------------------------------------------------
 CREATE PROCEDURE sp_transforma_locacoes()
 BEGIN
+    INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
+    SELECT 'stg_locacao', fn_frota_origem(), l.id_locacao,
+        CASE
+            WHEN l.id_cliente IS NULL         THEN 'Locação sem cliente'
+            WHEN l.id_veiculo IS NULL         THEN 'Locação sem veículo'
+            WHEN l.id_grupo IS NULL           THEN 'Locação sem grupo'
+            WHEN l.id_patio_retirada IS NULL  THEN 'Locação sem pátio de retirada'
+            WHEN l.data_hora_retirada IS NULL THEN 'Locação sem data de retirada'
+            WHEN l.data_hora_prev_devolucao IS NULL THEN 'Locação sem data prev. devolução'
+            WHEN l.data_hora_real_devolucao IS NOT NULL AND DATE(l.data_hora_real_devolucao) < DATE(l.data_hora_retirada) THEN 'Data devolução real anterior à retirada'
+            ELSE 'Erro desconhecido'
+        END,
+        JSON_OBJECT('nk_id_locacao', l.id_locacao, 'nk_id_cliente', l.id_cliente, 'nk_id_veiculo', l.id_veiculo, 'nk_id_grupo', l.id_grupo, 'nk_id_patio_retirada', l.id_patio_retirada, 'data_retirada', l.data_hora_retirada, 'data_prev_devolucao', l.data_hora_prev_devolucao, 'data_real_devolucao', l.data_hora_real_devolucao, 'valor_final', l.valor_final)
+    FROM stg_locacao l
+    WHERE l.id_cliente IS NULL OR l.id_veiculo IS NULL OR l.id_grupo IS NULL OR l.id_patio_retirada IS NULL OR l.data_hora_retirada IS NULL OR l.data_hora_prev_devolucao IS NULL OR (l.data_hora_real_devolucao IS NOT NULL AND DATE(l.data_hora_real_devolucao) < DATE(l.data_hora_retirada));
+
     INSERT INTO trf_fato_locacao
         (nk_frota_origem, nk_id_locacao, dt_retirada, dt_prev_devolucao,
          dt_real_devolucao, nk_id_cliente, nk_id_veiculo, nk_id_grupo,
@@ -236,6 +265,23 @@ END$$
 -- ---- 2.3) Fato_Reserva (calcula duracao e valor previsto) --------------------
 CREATE PROCEDURE sp_transforma_reservas()
 BEGIN
+    INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
+    SELECT 'stg_reserva', fn_frota_origem(), r.id_reserva,
+        CASE
+            WHEN r.id_cliente IS NULL            THEN 'Reserva sem cliente'
+            WHEN r.id_grupo IS NULL              THEN 'Reserva sem grupo'
+            WHEN r.id_patio_retirada IS NULL     THEN 'Reserva sem pátio de retirada'
+            WHEN r.id_patio_devolucao_previsto IS NULL THEN 'Reserva sem pátio de fim'
+            WHEN r.data_reserva IS NULL             THEN 'Reserva sem data de reserva'
+            WHEN r.data_prev_retirada IS NULL   THEN 'Reserva sem data de retirada prevista'
+            WHEN r.data_prev_devolucao IS NULL  THEN 'Reserva sem data de devolução prevista'
+            WHEN r.data_prev_devolucao <= r.data_prev_retirada THEN 'Data devolução <= data retirada'
+            ELSE 'Erro desconhecido'
+        END,
+        JSON_OBJECT('nk_id_reserva', r.id_reserva, 'nk_id_cliente', r.id_cliente, 'nk_id_grupo', r.id_grupo, 'nk_id_patio_retirada', r.id_patio_retirada, 'nk_id_patio_fim', r.id_patio_devolucao_previsto, 'data_reserva', r.data_reserva, 'data_retirada_prevista', r.data_prev_retirada, 'data_devolucao_prevista', r.data_prev_devolucao)
+    FROM stg_reserva r
+    WHERE r.id_cliente IS NULL OR r.id_grupo IS NULL OR r.id_patio_retirada IS NULL OR r.id_patio_devolucao_previsto IS NULL OR r.data_reserva IS NULL OR r.data_prev_retirada IS NULL OR r.data_prev_devolucao IS NULL OR r.data_prev_devolucao <= r.data_prev_retirada;
+
     INSERT INTO trf_fato_reserva
         (nk_frota_origem, nk_id_reserva, dt_reserva, dt_prev_retirada,
          dt_prev_devolucao, nk_id_cliente, nk_id_grupo, nk_id_patio_retirada,
@@ -421,9 +467,27 @@ ON DUPLICATE KEY UPDATE
 CREATE TRIGGER trg_trf_reserva_ai
 AFTER INSERT ON stg_reserva
 FOR EACH ROW
-INSERT INTO trf_fato_reserva
-    (nk_frota_origem, nk_id_reserva, dt_reserva, dt_prev_retirada,
-     dt_prev_devolucao, nk_id_cliente, nk_id_grupo, nk_id_patio_retirada,
+BEGIN
+IF NEW.id_cliente IS NULL OR NEW.id_grupo IS NULL OR NEW.id_patio_retirada IS NULL OR NEW.id_patio_devolucao_previsto IS NULL OR NEW.data_reserva IS NULL OR NEW.data_prev_retirada IS NULL OR NEW.data_prev_devolucao IS NULL OR NEW.data_prev_devolucao <= NEW.data_prev_retirada THEN
+    INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
+    VALUES ('stg_reserva', fn_frota_origem(), NEW.id_reserva,
+        CASE
+            WHEN NEW.id_cliente IS NULL            THEN 'Reserva sem cliente'
+            WHEN NEW.id_grupo IS NULL              THEN 'Reserva sem grupo'
+            WHEN NEW.id_patio_retirada IS NULL     THEN 'Reserva sem pátio de retirada'
+            WHEN NEW.id_patio_devolucao_previsto IS NULL THEN 'Reserva sem pátio de fim'
+            WHEN NEW.data_reserva IS NULL             THEN 'Reserva sem data de reserva'
+            WHEN NEW.data_prev_retirada IS NULL   THEN 'Reserva sem data de retirada prevista'
+            WHEN NEW.data_prev_devolucao IS NULL  THEN 'Reserva sem data de devolução prevista'
+            WHEN NEW.data_prev_devolucao <= NEW.data_prev_retirada THEN 'Data devolução <= data retirada'
+            ELSE 'Erro desconhecido'
+        END,
+        JSON_OBJECT('nk_id_reserva', NEW.id_reserva, 'nk_id_cliente', NEW.id_cliente, 'nk_id_grupo', NEW.id_grupo, 'nk_id_patio_retirada', NEW.id_patio_retirada, 'nk_id_patio_fim', NEW.id_patio_devolucao_previsto, 'data_reserva', NEW.data_reserva, 'data_retirada_prevista', NEW.data_prev_retirada, 'data_devolucao_prevista', NEW.data_prev_devolucao)
+    );
+ELSE
+    INSERT INTO trf_fato_reserva
+        (nk_frota_origem, nk_id_reserva, dt_reserva, dt_prev_retirada,
+         dt_prev_devolucao, nk_id_cliente, nk_id_grupo, nk_id_patio_retirada,
      nk_id_patio_fim, duracao_prevista_dias, valor_previsto_reserva,
      dd_status_reserva, qtde_reservas)
 VALUES (fn_frota_origem(), NEW.id_reserva, NEW.data_reserva, NEW.data_prev_retirada,
@@ -441,14 +505,18 @@ ON DUPLICATE KEY UPDATE
     nk_id_patio_fim = VALUES(nk_id_patio_fim),
     duracao_prevista_dias = VALUES(duracao_prevista_dias),
     valor_previsto_reserva = VALUES(valor_previsto_reserva),
-    dd_status_reserva = VALUES(dd_status_reserva)$$
+    dd_status_reserva = VALUES(dd_status_reserva);
+END IF;
+END$$
 
 CREATE TRIGGER trg_trf_reserva_au
 AFTER UPDATE ON stg_reserva
 FOR EACH ROW
-INSERT INTO trf_fato_reserva
-    (nk_frota_origem, nk_id_reserva, dt_reserva, dt_prev_retirada,
-     dt_prev_devolucao, nk_id_cliente, nk_id_grupo, nk_id_patio_retirada,
+BEGIN
+IF NEW.id_cliente IS NOT NULL AND NEW.id_grupo IS NOT NULL AND NEW.id_patio_retirada IS NOT NULL AND NEW.id_patio_devolucao_previsto IS NOT NULL AND NEW.data_reserva IS NOT NULL AND NEW.data_prev_retirada IS NOT NULL AND NEW.data_prev_devolucao IS NOT NULL AND NEW.data_prev_devolucao > NEW.data_prev_retirada THEN
+    INSERT INTO trf_fato_reserva
+        (nk_frota_origem, nk_id_reserva, dt_reserva, dt_prev_retirada,
+         dt_prev_devolucao, nk_id_cliente, nk_id_grupo, nk_id_patio_retirada,
      nk_id_patio_fim, duracao_prevista_dias, valor_previsto_reserva,
      dd_status_reserva, qtde_reservas)
 VALUES (fn_frota_origem(), NEW.id_reserva, NEW.data_reserva, NEW.data_prev_retirada,
@@ -466,17 +534,36 @@ ON DUPLICATE KEY UPDATE
     nk_id_patio_fim = VALUES(nk_id_patio_fim),
     duracao_prevista_dias = VALUES(duracao_prevista_dias),
     valor_previsto_reserva = VALUES(valor_previsto_reserva),
-    dd_status_reserva = VALUES(dd_status_reserva)$$
+    dd_status_reserva = VALUES(dd_status_reserva);
+END IF;
+END$$
 
 -- ----------------------------- LOCACAO --------------------------------------
 -- INSERT  = nova locacao; UPDATE = devolucao (preenche datas/patio/valor reais).
 CREATE TRIGGER trg_trf_locacao_ai
 AFTER INSERT ON stg_locacao
 FOR EACH ROW
-INSERT INTO trf_fato_locacao
-    (nk_frota_origem, nk_id_locacao, dt_retirada, dt_prev_devolucao,
-     dt_real_devolucao, nk_id_cliente, nk_id_veiculo, nk_id_grupo,
-     nk_id_patio_retirada, nk_id_patio_devol_real, valor_final, qtde_locacoes)
+BEGIN
+IF NEW.id_cliente IS NULL OR NEW.id_veiculo IS NULL OR NEW.id_grupo IS NULL OR NEW.id_patio_retirada IS NULL OR NEW.data_hora_retirada IS NULL OR NEW.data_hora_prev_devolucao IS NULL OR (NEW.data_hora_real_devolucao IS NOT NULL AND DATE(NEW.data_hora_real_devolucao) < DATE(NEW.data_hora_retirada)) THEN
+    INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
+    VALUES ('stg_locacao', fn_frota_origem(), NEW.id_locacao,
+        CASE
+            WHEN NEW.id_cliente IS NULL         THEN 'Locação sem cliente'
+            WHEN NEW.id_veiculo IS NULL         THEN 'Locação sem veículo'
+            WHEN NEW.id_grupo IS NULL           THEN 'Locação sem grupo'
+            WHEN NEW.id_patio_retirada IS NULL  THEN 'Locação sem pátio de retirada'
+            WHEN NEW.data_hora_retirada IS NULL THEN 'Locação sem data de retirada'
+            WHEN NEW.data_hora_prev_devolucao IS NULL THEN 'Locação sem data prev. devolução'
+            WHEN NEW.data_hora_real_devolucao IS NOT NULL AND DATE(NEW.data_hora_real_devolucao) < DATE(NEW.data_hora_retirada) THEN 'Data devolução real anterior à retirada'
+            ELSE 'Erro desconhecido'
+        END,
+        JSON_OBJECT('nk_id_locacao', NEW.id_locacao, 'nk_id_cliente', NEW.id_cliente, 'nk_id_veiculo', NEW.id_veiculo, 'nk_id_grupo', NEW.id_grupo, 'nk_id_patio_retirada', NEW.id_patio_retirada, 'data_retirada', NEW.data_hora_retirada, 'data_prev_devolucao', NEW.data_hora_prev_devolucao, 'data_real_devolucao', NEW.data_hora_real_devolucao, 'valor_final', NEW.valor_final)
+    );
+ELSE
+    INSERT INTO trf_fato_locacao
+        (nk_frota_origem, nk_id_locacao, dt_retirada, dt_prev_devolucao,
+         dt_real_devolucao, nk_id_cliente, nk_id_veiculo, nk_id_grupo,
+         nk_id_patio_retirada, nk_id_patio_devol_real, valor_final, qtde_locacoes)
 VALUES (fn_frota_origem(), NEW.id_locacao, DATE(NEW.data_hora_retirada),
         DATE(NEW.data_hora_prev_devolucao), DATE(NEW.data_hora_real_devolucao),
         NEW.id_cliente, NEW.id_veiculo, NEW.id_grupo, NEW.id_patio_retirada,
@@ -485,17 +572,20 @@ ON DUPLICATE KEY UPDATE
     dt_retirada = VALUES(dt_retirada), dt_prev_devolucao = VALUES(dt_prev_devolucao),
     dt_real_devolucao = VALUES(dt_real_devolucao), nk_id_cliente = VALUES(nk_id_cliente),
     nk_id_veiculo = VALUES(nk_id_veiculo), nk_id_grupo = VALUES(nk_id_grupo),
-    nk_id_patio_retirada = VALUES(nk_id_patio_retirada),
     nk_id_patio_devol_real = VALUES(nk_id_patio_devol_real),
-    valor_final = VALUES(valor_final)$$
+    valor_final = VALUES(valor_final);
+END IF;
+END$$
 
 CREATE TRIGGER trg_trf_locacao_au
 AFTER UPDATE ON stg_locacao
 FOR EACH ROW
-INSERT INTO trf_fato_locacao
-    (nk_frota_origem, nk_id_locacao, dt_retirada, dt_prev_devolucao,
-     dt_real_devolucao, nk_id_cliente, nk_id_veiculo, nk_id_grupo,
-     nk_id_patio_retirada, nk_id_patio_devol_real, valor_final, qtde_locacoes)
+BEGIN
+IF NEW.id_cliente IS NOT NULL AND NEW.id_veiculo IS NOT NULL AND NEW.id_grupo IS NOT NULL AND NEW.id_patio_retirada IS NOT NULL AND NEW.data_hora_retirada IS NOT NULL AND NEW.data_hora_prev_devolucao IS NOT NULL AND (NEW.data_hora_real_devolucao IS NULL OR DATE(NEW.data_hora_real_devolucao) >= DATE(NEW.data_hora_retirada)) THEN
+    INSERT INTO trf_fato_locacao
+        (nk_frota_origem, nk_id_locacao, dt_retirada, dt_prev_devolucao,
+         dt_real_devolucao, nk_id_cliente, nk_id_veiculo, nk_id_grupo,
+         nk_id_patio_retirada, nk_id_patio_devol_real, valor_final, qtde_locacoes)
 VALUES (fn_frota_origem(), NEW.id_locacao, DATE(NEW.data_hora_retirada),
         DATE(NEW.data_hora_prev_devolucao), DATE(NEW.data_hora_real_devolucao),
         NEW.id_cliente, NEW.id_veiculo, NEW.id_grupo, NEW.id_patio_retirada,
@@ -504,9 +594,10 @@ ON DUPLICATE KEY UPDATE
     dt_retirada = VALUES(dt_retirada), dt_prev_devolucao = VALUES(dt_prev_devolucao),
     dt_real_devolucao = VALUES(dt_real_devolucao), nk_id_cliente = VALUES(nk_id_cliente),
     nk_id_veiculo = VALUES(nk_id_veiculo), nk_id_grupo = VALUES(nk_id_grupo),
-    nk_id_patio_retirada = VALUES(nk_id_patio_retirada),
     nk_id_patio_devol_real = VALUES(nk_id_patio_devol_real),
-    valor_final = VALUES(valor_final)$$
+    valor_final = VALUES(valor_final);
+END IF;
+END$$
 
 -- --------------------------- INVENTARIO -------------------------------------
 CREATE TRIGGER trg_trf_inventario_ai

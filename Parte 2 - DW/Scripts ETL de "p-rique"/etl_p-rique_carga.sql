@@ -290,6 +290,8 @@ BEGIN
                 CONCAT('GRUPO NÃO EM DIM_GRUPO: nk=', CAST(l.nk_id_grupo AS CHAR))
             WHEN dp_ret.sk_patio IS NULL THEN
                 CONCAT('PÁTIO RETIRADA NÃO EM DIM_PATIO: nk=', CAST(l.nk_id_patio_retirada AS CHAR))
+            WHEN l.nk_id_patio_devolucao IS NOT NULL AND dp_dev.sk_patio IS NULL THEN
+                CONCAT('PÁTIO DEVOLUÇÃO NÃO EM DIM_PATIO: nk=', CAST(l.nk_id_patio_devolucao AS CHAR))
         END
     FROM staging.stg_conf_locacao l
     LEFT JOIN dw.dim_cliente dc
@@ -311,6 +313,7 @@ BEGIN
          OR dv.sk_veiculo IS NULL
          OR dg.sk_grupo IS NULL
          OR dp_ret.sk_patio IS NULL
+         OR (l.nk_id_patio_devolucao IS NOT NULL AND dp_dev.sk_patio IS NULL)
       );
 
     SET v_rejeit = ROW_COUNT();
