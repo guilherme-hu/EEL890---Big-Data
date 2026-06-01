@@ -26,14 +26,12 @@
 --   fato_inventario   → UPSERT por (sk_tempo, sk_patio, sk_veiculo)
 --   fato_locacao      → UPSERT por (nk_frota_origem, nk_id_locacao)
 --   fato_reserva      → UPSERT por (nk_frota_origem, nk_id_reserva)
--- =============================================================================
 
 
 
--- =========================================================================
+
+
 --  2) PROCEDURES DE CARGA — DIMENSÕES
--- =========================================================================
-
 --  2.0) sp_prique_carga_dim_endereco
 DELIMITER //
 DROP PROCEDURE IF EXISTS dw.sp_prique_carga_dim_endereco//
@@ -177,12 +175,7 @@ BEGIN
     SET v_total = ROW_COUNT();
 END//
 
-
-
--- =========================================================================
 --  3) PROCEDURES DE CARGA — FATOS
--- =========================================================================
-
 --  3.1) sp_prique_carga_fato_inventario_patio
 --       Carrega snapshots diários de veículos em pátios.
 --       Garante que as datas existam em Dim_Tempo antes do INSERT.
@@ -527,12 +520,7 @@ BEGIN
     SET v_total = ROW_COUNT();
 END//
 
-
-
--- =========================================================================
 --  4) PROCEDURE MAIN DE CARGA
--- =========================================================================
-
 DROP PROCEDURE IF EXISTS dw.sp_prique_carga_completa//
 CREATE PROCEDURE dw.sp_prique_carga_completa()
 BEGIN
@@ -554,11 +542,8 @@ END//
 DELIMITER ;
 
 
--- =========================================================================
 --  5) SCRIPT DE EXECUÇÃO SEQUENCIAL COMPLETA DO ETL p-rique
 --     (Extração → Transformação → Carga)
--- =========================================================================
-
 /*
   -- Execução completa do ETL p-rique:
   CALL staging.sp_prique_extracao_completa();
