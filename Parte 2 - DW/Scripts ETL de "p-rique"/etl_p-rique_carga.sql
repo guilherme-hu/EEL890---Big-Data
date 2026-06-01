@@ -5,32 +5,6 @@
 -- Guilherme En Shih Hu (123224674)
 -- Maria Victoria França Silva Ramos (123311073)
 
-
--- =============================================================================
--- etl_p-rique_carga.sql
--- Carga ETL — Staging Conformado → Data Warehouse (p-rique)
---
--- Execução: após etl_p-rique_transformacao.sql
--- Bancos: staging (fonte) → dw (destino)
---
--- IMPORTANTE: As funções auxiliares (fn_sk_tempo, sp_garante_dim_tempo)
--- já foram criadas pelo script de carga do gupessanha. Este script
--- reutiliza essas funções e carrega os dados do p-rique nas mesmas
--- tabelas do DW, identificados por nk_frota_origem = 'p-rique'.
---
--- Estratégias de carga por objeto:
---   dim_patio         → UPSERT (ON DUPLICATE KEY UPDATE)
---   dim_grupo         → UPSERT (ON DUPLICATE KEY UPDATE)
---   dim_veiculo       → UPSERT (ON DUPLICATE KEY UPDATE)
---   dim_cliente       → UPSERT (ON DUPLICATE KEY UPDATE)
---   fato_inventario   → UPSERT por (sk_tempo, sk_patio, sk_veiculo)
---   fato_locacao      → UPSERT por (nk_frota_origem, nk_id_locacao)
---   fato_reserva      → UPSERT por (nk_frota_origem, nk_id_reserva)
-
-
-
-
-
 --  2) PROCEDURES DE CARGA — DIMENSÕES
 --  2.0) sp_prique_carga_dim_endereco
 DELIMITER //
@@ -540,30 +514,3 @@ BEGIN
 END//
 
 DELIMITER ;
-
-
---  5) SCRIPT DE EXECUÇÃO SEQUENCIAL COMPLETA DO ETL p-rique
---     (Extração → Transformação → Carga)
-/*
-  -- Execução completa do ETL p-rique:
-  CALL staging.sp_prique_extracao_completa();
-  CALL staging.sp_prique_transformacao_completa();
-  CALL dw.sp_prique_carga_completa();
-
-  -- Pipeline integrado (gupessanha + p-rique):
-  -- 1) Extração de ambas as frotas
-  CALL staging.sp_gupessanha_extracao_completa(TRUE);
-  CALL staging.sp_prique_extracao_completa();
-
-  -- 2) Transformação (gupessanha PRIMEIRO, depois p-rique)
-  CALL staging.sp_gupessanha_transformacao_completa();
-  CALL staging.sp_prique_transformacao_completa();
-
-  -- 3) Carga (qualquer ordem, pois as dimensões são UPSERT por NK)
-  CALL dw.sp_gupessanha_carga_completa();
-  CALL dw.sp_prique_carga_completa();
-
-  -- Verificar rejeitos de ambas as frotas:
-  SELECT * FROM staging.vw_ia_qualidade_etl;
-  SELECT * FROM staging.stg_rejeitos_etl ORDER BY dt_rejeito DESC LIMIT 50;
-*/
