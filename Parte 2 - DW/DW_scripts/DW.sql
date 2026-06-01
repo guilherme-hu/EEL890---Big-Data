@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS dw.dim_veiculo (
     nk_id_veiculo INT NOT NULL,
     placa VARCHAR(10),
     marca VARCHAR(50),
-    modelo VARCHAR(60),
+    modelo VARCHAR(50),
     mecanizacao VARCHAR(20),
     tem_ar_condicionado BOOLEAN,
     CONSTRAINT pk_dim_veiculo PRIMARY KEY (sk_veiculo),
@@ -92,7 +92,7 @@ CREATE TABLE IF NOT EXISTS dw.dim_grupo (
     sk_grupo INT NOT NULL AUTO_INCREMENT,
     nk_frota_origem VARCHAR(100) NOT NULL,
     nk_id_grupo INT NOT NULL,
-    nome_grupo VARCHAR(80),
+    nome_grupo VARCHAR(50),
     valor_diaria DECIMAL(10,2),
     CONSTRAINT pk_dim_grupo PRIMARY KEY (sk_grupo),
     CONSTRAINT uk_dim_grupo_nk UNIQUE (nk_frota_origem, nk_id_grupo),
@@ -109,11 +109,8 @@ CREATE TABLE IF NOT EXISTS dw.dim_patio (
     nk_id_patio INT NOT NULL,
     nome_patio VARCHAR(100),
     capacidade_vagas_patio INT DEFAULT -1,
-    sk_endereco INT,
     CONSTRAINT pk_dim_patio PRIMARY KEY (sk_patio),
-    CONSTRAINT uk_dim_patio_nk UNIQUE (nk_frota_origem, nk_id_patio),
-    CONSTRAINT fk_dim_patio_endereco FOREIGN KEY (sk_endereco) 
-        REFERENCES dw.dim_endereco (sk_endereco)
+    CONSTRAINT uk_dim_patio_nk UNIQUE (nk_frota_origem, nk_id_patio)
 );
 
 -- ----------------------------------------------------------------------------
@@ -124,13 +121,6 @@ CREATE TABLE IF NOT EXISTS dw.dim_patio (
 CREATE TABLE IF NOT EXISTS dw.dim_tempo (
     sk_tempo INT NOT NULL,
     data DATE NOT NULL,
-    ano INT,
-    trimestre INT,
-    mes INT,
-    semana_ano INT,
-    dia_semana INT,
-    nome_mes VARCHAR(20),
-    nome_dia VARCHAR(20),
     CONSTRAINT pk_dim_tempo PRIMARY KEY (sk_tempo),
     CONSTRAINT uk_dim_tempo_nk UNIQUE (data)
 );
@@ -142,7 +132,7 @@ CREATE TABLE IF NOT EXISTS dw.dim_tempo (
 -- temporal exigido.
 SET SESSION cte_max_recursion_depth = 10000;
 
-INSERT INTO dw.dim_tempo (sk_tempo, data, ano, trimestre, mes, semana_ano, dia_semana, nome_mes, nome_dia)
+INSERT INTO dw.dim_tempo (sk_tempo, data)
 WITH RECURSIVE Datas_CTE AS (
     SELECT CAST('2015-01-01' AS DATE) AS data_ref
     UNION ALL
@@ -152,14 +142,7 @@ WITH RECURSIVE Datas_CTE AS (
 )
 SELECT 
     CAST(DATE_FORMAT(data_ref, '%Y%m%d') AS UNSIGNED) AS sk_tempo,
-    data_ref AS data,
-    YEAR(data_ref) AS ano,
-    QUARTER(data_ref) AS trimestre,
-    MONTH(data_ref) AS mes,
-    WEEK(data_ref, 3) AS semana_ano,
-    WEEKDAY(data_ref) + 1 AS dia_semana,
-    DATE_FORMAT(data_ref, '%M') AS nome_mes,
-    DATE_FORMAT(data_ref, '%W') AS nome_dia
+    data_ref AS data
 FROM Datas_CTE
 WHERE NOT EXISTS (SELECT 1 FROM dw.dim_tempo LIMIT 1);
 
