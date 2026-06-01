@@ -1,58 +1,18 @@
--- ============================================================================
--- TRABALHO DE BIG DATA / DATA WAREHOUSE - MAE016 (PARTE II)
--- ----------------------------------------------------------------------------
 -- Grupo:
 -- Bernardo Brandão Pozzato Carvalho Costa (123289593)
 -- Enzo de Carvalho Sampaio (123386206)
 -- Giovanni Faletti Almeida (123184214)
 -- Guilherme En Shih Hu (123224674)
 -- Maria Victoria França Silva Ramos (123311073)
--- ----------------------------------------------------------------------------
--- Arquivo : 01_extracao_NOVOOK.sql
--- Etapa   : EXTRACAO  (o "E" do ETL)
--- Fonte   : OLTP do grupo "valviessejoao" (apelido "Ok novo")
---           Repositorio: https://github.com/valviessejoao/mae016-bdd-dwh-projeto1
--- Destino : Area de STAGING BRUTA compartilhada -> schema `staging`,
---           tabelas prefixadas `stg_valviessejoao_*` (uma instancia por fonte).
--- SGBD    : MySQL 8.x
---
--- Conformidade com o consorcio (plano de adaptacao da equipe):
---   * (item 2) Schema de staging unico chamado `staging` (e nao dw_staging).
---   * (item 3) Tabelas brutas prefixadas pela origem: `stg_valviessejoao_*`.
---   * (item 5) Triggers AFTER INSERT/UPDATE no OLTP para TODAS as entidades de
---     interesse do DW (Cliente, Veiculo, Grupo, Patio, Reserva, Locacao),
---     replicando instantaneamente para a area bruta.
---
--- Mecanismos de acionamento (especificacao dos tempos de extracao):
---   (A) CDC em tempo (quase) real -> TRIGGERS nas 6 tabelas-fonte.
---   (B) CARGA TOTAL de "rede de seguranca" -> procedures sp_valviessejoao_extrai_*
---       agendadas por EVENTs diarios (reconciliacao + backfill inicial).
---   (C) SNAPSHOT diario do inventario de patio -> EVENT diario (em MySQL o
---       "gatilho temporal" e um EVENT; nao e capturavel por trigger de linha).
---
--- OBS 1: A fonte OLTP esta referenciada como schema `novook`. Se o banco do
---        grupo valviessejoao tiver outro nome, troque todas as referencias
---        "novook." abaixo pelo nome correto do schema de origem.
--- OBS 2: As tabelas brutas guardam SOMENTE os dados desta fonte; o carimbo
---        nk_frota_origem='valviessejoao' e a uniao com as demais frotas
---        acontecem na etapa de Transformacao (script 02).
--- ============================================================================
 
--- ----------------------------------------------------------------------------
--- 0) Pre-requisitos de ambiente
--- ----------------------------------------------------------------------------
--- Cria (se necessario) a area de staging COMPARTILHADA do consorcio.
--- OBS: o EVENT SCHEDULER e ligado no FIM do script (secao 5), de proposito:
--- assim, mesmo sem privilegio SUPER, todos os objetos sao criados normalmente.
 CREATE DATABASE IF NOT EXISTS staging
   CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 USE staging;
 
--- ============================================================================
 -- 1) TABELAS DE STAGING BRUTO (copia "raw" da fonte valviessejoao)
 --    Conceitos do DW: cliente, veiculo, grupo, patio, reserva, locacao
 --    (+ inventario de patio derivado de VEICULO). Coluna data_extracao p/ CDC.
--- ============================================================================
+
 
 DROP TABLE IF EXISTS stg_valviessejoao_inventario_patio;
 DROP TABLE IF EXISTS stg_valviessejoao_locacao;
@@ -162,11 +122,10 @@ CREATE TABLE stg_valviessejoao_inventario_patio (
     PRIMARY KEY (data_snapshot, id_veiculo)
 ) ENGINE=InnoDB;
 
--- ============================================================================
+
 -- 2) EXTRACAO POR CARGA TOTAL (procedures) -- backfill inicial + reconciliacao
 --    Reexecutaveis (TRUNCATE + INSERT...SELECT). Prefixadas pelo handle pois o
 --    schema `staging` e compartilhado por todas as frotas do consorcio.
--- ============================================================================
 
 DROP PROCEDURE IF EXISTS sp_valviessejoao_extrai_dimensoes;
 DROP PROCEDURE IF EXISTS sp_valviessejoao_extrai_reservas;
@@ -258,15 +217,12 @@ END$$
 
 DELIMITER ;
 
--- ============================================================================
--- 3) EXTRACAO POR CDC (TRIGGERS no OLTP de origem) -- item 5 do plano
+--- 3) EXTRACAO POR CDC (TRIGGERS no OLTP de origem) -- item 5 do plano
 --    Triggers AFTER INSERT/AFTER UPDATE para TODAS as entidades do DW:
 --    Cliente, Veiculo, Grupo, Patio (dimensoes) + Reserva, Locacao (fatos).
 --    Cada trigger faz UPSERT na respectiva tabela bruta stg_valviessejoao_*.
 --    OBS: os triggers pertencem ao schema da FONTE (novook); por isso o
 --    DROP e o CREATE sao qualificados com "novook.".
--- ============================================================================
-
 -- ----------------------------- CLIENTE --------------------------------------
 DROP TRIGGER IF EXISTS novook.trg_ext_valviessejoao_cliente_ai;
 DROP TRIGGER IF EXISTS novook.trg_ext_valviessejoao_cliente_au;
@@ -476,14 +432,12 @@ ON DUPLICATE KEY UPDATE
 
 DELIMITER ;
 
--- ============================================================================
 -- 4) AGENDAMENTO (TEMPOS DE ACIONAMENTO) -- rede de seguranca + inventario
 --    Politica:
 --      * CDC em tempo real pelos TRIGGERS acima (mecanismo principal).
 --      * Carga total de reconciliacao: dimensoes 23:00 e movimento 23:15.
 --      * Snapshot diario do inventario: 23:50 (fim do dia operacional).
 --    EVENTs prefixados pelo handle (schema `staging` e compartilhado).
--- ============================================================================
 
 DROP EVENT IF EXISTS ev_valviessejoao_extrai_dimensoes;
 DROP EVENT IF EXISTS ev_valviessejoao_extrai_movimento;
@@ -518,20 +472,16 @@ END$$
 
 DELIMITER ;
 
--- ============================================================================
 -- 5) HABILITAR O AGENDADOR DE EVENTOS
 --    Requer privilegio SUPER / SYSTEM_VARIABLES_ADMIN. Se falhar por falta de
 --    privilegio, peca ao DBA; o restante do ETL funciona normalmente sem ele.
--- ============================================================================
+
 SET GLOBAL event_scheduler = ON;
 
--- ============================================================================
 -- 6) CARGA INICIAL / BACKFILL (executar uma vez na primeira montagem)
 --    Depois disso, os TRIGGERS mantem o staging atualizado em tempo real.
--- ============================================================================
 CALL sp_valviessejoao_extrai_dimensoes();
 CALL sp_valviessejoao_extrai_reservas();
 CALL sp_valviessejoao_extrai_locacoes();
 CALL sp_valviessejoao_snapshot_inventario(CURRENT_DATE);
 
--- FIM DO SCRIPT DE EXTRACAO (valviessejoao)
