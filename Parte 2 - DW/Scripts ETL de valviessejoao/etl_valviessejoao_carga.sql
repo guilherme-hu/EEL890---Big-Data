@@ -4,437 +4,369 @@
 -- Giovanni Faletti Almeida (123184214)
 -- Guilherme En Shih Hu (123224674)
 -- Maria Victoria França Silva Ramos (123311073)
+-- ============================================================================
+-- ETL valviessejoao - CARGA (o "L"/Load)
+-- Entrada : staging.stg_conf_*   (conformado COMPARTILHADO; gerado pelo 02)
+-- Saida   : dw.*                 (esquema estrela CENTRAL, criado por DW.sql)
+-- Rejeitos: staging.stg_rejeitos_etl
+-- SGBD    : MySQL 8.x
+--
+-- Pre-requisito: rodar DW.sql ANTES (cria o schema `dw`, as dim_/fato_ e
+-- pre-popula dim_tempo 2015-2035). Esta carga NAO cria o esquema do DW; apenas
+-- popula via procedures sp_valviessejoao_carga_* (UPSERT = SCD1), igual gui-hu/
+-- p-rique. Resolve as Surrogate Keys por JOIN nas dimensoes pela Chave Natural
+-- (nk_frota_origem + nk_id_*). Linhas cujas SKs nao resolvem viram rejeitos
+-- (qualidade de dados) em vez de quebrar a carga.
+-- ============================================================================
 
+-- ============================================================================
+-- 1) UTILITARIOS COMPARTILHADOS DO DW (data -> sk_tempo; garante dim_tempo)
+--    Definidos de forma idempotente; identicos entre as frotas do consorcio.
+-- ============================================================================
 
-CREATE DATABASE IF NOT EXISTS dw_locadora
-  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-USE dw_locadora;
-
--- 1) ESQUEMA ESTRELA (cria apenas se ainda nao existir)
---    Dimensoes primeiro; fatos por ultimo (por causa das FKs).
-
--- ---- Dim_Endereco -----------------------------------------------------------
-CREATE TABLE IF NOT EXISTS dim_endereco (
-    sk_endereco INT AUTO_INCREMENT PRIMARY KEY,
-    cidade      VARCHAR(100) NOT NULL,
-    estado      VARCHAR(100) NOT NULL,
-    pais        VARCHAR(100) NOT NULL,
-    CONSTRAINT uq_endereco UNIQUE (cidade, estado, pais)
-) ENGINE=InnoDB;
-
--- ---- Dim_Cliente ------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS dim_cliente (
-    sk_cliente      INT AUTO_INCREMENT PRIMARY KEY,
-    nk_frota_origem VARCHAR(100) NOT NULL,   -- GOAT / IA / AMARELO / NOVOOK
-    nk_id_cliente   INT          NOT NULL,   -- id no sistema de origem
-    tipo_cliente    VARCHAR(2),              -- PF / PJ
-    nome            VARCHAR(150),
-    sk_endereco     INT,
-    CONSTRAINT uq_cliente_nk UNIQUE (nk_frota_origem, nk_id_cliente),
-    CONSTRAINT fk_cliente_endereco FOREIGN KEY (sk_endereco)
-        REFERENCES dim_endereco (sk_endereco)
-) ENGINE=InnoDB;
-
--- ---- Dim_Veiculo ------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS dim_veiculo (
-    sk_veiculo          INT AUTO_INCREMENT PRIMARY KEY,
-    nk_frota_origem     VARCHAR(100) NOT NULL,
-    nk_id_veiculo       INT          NOT NULL,
-    placa               VARCHAR(10),
-    marca               VARCHAR(50),
-    modelo              VARCHAR(50),
-    mecanizacao         VARCHAR(20),
-    tem_ar_condicionado BOOLEAN,
-    CONSTRAINT uq_veiculo_nk UNIQUE (nk_frota_origem, nk_id_veiculo)
-) ENGINE=InnoDB;
-
--- ---- Dim_Grupo --------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS dim_grupo (
-    sk_grupo        INT AUTO_INCREMENT PRIMARY KEY,
-    nk_frota_origem VARCHAR(100)  NOT NULL,
-    nk_id_grupo     INT           NOT NULL,
-    nome_grupo      VARCHAR(50),
-    valor_diaria    DECIMAL(10,2),
-    CONSTRAINT uq_grupo_nk UNIQUE (nk_frota_origem, nk_id_grupo)
-) ENGINE=InnoDB;
-
--- ---- Dim_Patio --------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS dim_patio (
-    sk_patio         INT AUTO_INCREMENT PRIMARY KEY,
-    nk_frota_origem  VARCHAR(100) NOT NULL,
-    nk_id_patio      INT          NOT NULL,
-    nome_patio       VARCHAR(100),
-    capacidade_vagas INT,                    -- pode ser NULL (fonte sem o dado)
-    CONSTRAINT uq_patio_nk UNIQUE (nk_frota_origem, nk_id_patio)
-) ENGINE=InnoDB;
-
--- ---- Dim_Tempo (sk_tempo = YYYYMMDD) ----------------------------------------
--- Atributos extras (ano/mes/dia/trimestre/nome_mes/dia_semana/fim_de_semana)
--- foram incluidos para apoiar os relatorios gerenciais por periodo.
-CREATE TABLE IF NOT EXISTS dim_tempo (
-    sk_tempo          INT  PRIMARY KEY,       -- ex.: 20260531
-    data              DATE NOT NULL,
-    ano               INT,
-    mes               INT,
-    dia               INT,
-    trimestre         INT,
-    nome_mes          VARCHAR(15),
-    dia_semana        VARCHAR(15),
-    eh_fim_de_semana  BOOLEAN,
-    CONSTRAINT uq_tempo_data UNIQUE (data)
-) ENGINE=InnoDB;
-
--- ---- Fato_Inventario_Patio (grao: 1 veiculo presente por dia) ---------------
-CREATE TABLE IF NOT EXISTS fato_inventario_patio (
-    sk_fato_inventario      INT AUTO_INCREMENT PRIMARY KEY,
-    sk_tempo_referencia     INT NOT NULL,
-    sk_patio                INT NOT NULL,
-    sk_veiculo              INT NOT NULL,
-    sk_grupo                INT,
-    qtde_veiculos_presentes INT NOT NULL DEFAULT 1,
-    CONSTRAINT uq_inv UNIQUE (sk_tempo_referencia, sk_veiculo),
-    CONSTRAINT fk_inv_tempo   FOREIGN KEY (sk_tempo_referencia) REFERENCES dim_tempo (sk_tempo),
-    CONSTRAINT fk_inv_patio   FOREIGN KEY (sk_patio)   REFERENCES dim_patio (sk_patio),
-    CONSTRAINT fk_inv_veiculo FOREIGN KEY (sk_veiculo) REFERENCES dim_veiculo (sk_veiculo),
-    CONSTRAINT fk_inv_grupo   FOREIGN KEY (sk_grupo)   REFERENCES dim_grupo (sk_grupo)
-) ENGINE=InnoDB;
-
--- ---- Fato_Locacao (grao: 1 contrato de locacao) -----------------------------
-CREATE TABLE IF NOT EXISTS fato_locacao (
-    sk_fato_locacao         INT AUTO_INCREMENT PRIMARY KEY,
-    nk_frota_origem         VARCHAR(100) NOT NULL,  -- compoe a NK do fato
-    nk_id_locacao           INT          NOT NULL,
-    sk_tempo_retirada       INT NOT NULL,
-    sk_tempo_prev_devolucao INT,
-    sk_tempo_real_devolucao INT,                    -- NULL se nao devolvido
-    sk_cliente              INT,
-    sk_veiculo              INT,
-    sk_grupo                INT,
-    sk_patio_retirada       INT,
-    sk_patio_devolucao_real INT,                    -- NULL se nao devolvido
-    valor_final             DECIMAL(10,2),          -- NULL ate a devolucao
-    qtde_locacoes           INT NOT NULL DEFAULT 1,
-    CONSTRAINT uq_locacao_nk UNIQUE (nk_frota_origem, nk_id_locacao),
-    CONSTRAINT fk_loc_tempo_ret   FOREIGN KEY (sk_tempo_retirada)       REFERENCES dim_tempo (sk_tempo),
-    CONSTRAINT fk_loc_tempo_prev  FOREIGN KEY (sk_tempo_prev_devolucao) REFERENCES dim_tempo (sk_tempo),
-    CONSTRAINT fk_loc_tempo_real  FOREIGN KEY (sk_tempo_real_devolucao) REFERENCES dim_tempo (sk_tempo),
-    CONSTRAINT fk_loc_cliente     FOREIGN KEY (sk_cliente)              REFERENCES dim_cliente (sk_cliente),
-    CONSTRAINT fk_loc_veiculo     FOREIGN KEY (sk_veiculo)              REFERENCES dim_veiculo (sk_veiculo),
-    CONSTRAINT fk_loc_grupo       FOREIGN KEY (sk_grupo)                REFERENCES dim_grupo (sk_grupo),
-    CONSTRAINT fk_loc_patio_ret   FOREIGN KEY (sk_patio_retirada)       REFERENCES dim_patio (sk_patio),
-    CONSTRAINT fk_loc_patio_dev   FOREIGN KEY (sk_patio_devolucao_real) REFERENCES dim_patio (sk_patio)
-) ENGINE=InnoDB;
-
--- ---- Fato_Reserva (grao: 1 intencao de reserva) -----------------------------
-CREATE TABLE IF NOT EXISTS fato_reserva (
-    sk_fato_reserva         INT AUTO_INCREMENT PRIMARY KEY,
-    nk_frota_origem         VARCHAR(100) NOT NULL,
-    nk_id_reserva           INT          NOT NULL,
-    sk_tempo_reserva        INT,
-    sk_tempo_prev_retirada  INT,
-    sk_tempo_prev_devolucao INT,
-    sk_cliente              INT,
-    sk_grupo                INT,
-    sk_patio_retirada       INT,
-    sk_patio_fim            INT,
-    duracao_prevista_dias   INT,
-    valor_previsto_reserva  DECIMAL(10,2),
-    dd_status_reserva       VARCHAR(100),           -- dimensao degenerada
-    qtde_reservas           INT NOT NULL DEFAULT 1,
-    CONSTRAINT uq_reserva_nk UNIQUE (nk_frota_origem, nk_id_reserva),
-    CONSTRAINT fk_res_tempo_res   FOREIGN KEY (sk_tempo_reserva)        REFERENCES dim_tempo (sk_tempo),
-    CONSTRAINT fk_res_tempo_ret   FOREIGN KEY (sk_tempo_prev_retirada)  REFERENCES dim_tempo (sk_tempo),
-    CONSTRAINT fk_res_tempo_dev   FOREIGN KEY (sk_tempo_prev_devolucao) REFERENCES dim_tempo (sk_tempo),
-    CONSTRAINT fk_res_cliente     FOREIGN KEY (sk_cliente)              REFERENCES dim_cliente (sk_cliente),
-    CONSTRAINT fk_res_grupo       FOREIGN KEY (sk_grupo)                REFERENCES dim_grupo (sk_grupo),
-    CONSTRAINT fk_res_patio_ret   FOREIGN KEY (sk_patio_retirada)       REFERENCES dim_patio (sk_patio),
-    CONSTRAINT fk_res_patio_fim   FOREIGN KEY (sk_patio_fim)            REFERENCES dim_patio (sk_patio)
-) ENGINE=InnoDB;
-
-
--- 2) FUNCAO AUXILIAR: data -> sk_tempo (YYYYMMDD)
-DROP FUNCTION IF EXISTS fn_sk_tempo;
-DELIMITER $$
-CREATE FUNCTION fn_sk_tempo(d DATE) RETURNS INT
-DETERMINISTIC NO SQL
-RETURN IF(d IS NULL, NULL, YEAR(d) * 10000 + MONTH(d) * 100 + DAY(d))$$
+-- 1.1) Lookup data -> sk_tempo (a dim_tempo ja vem pre-populada pelo DW.sql)
+DROP FUNCTION IF EXISTS dw.fn_sk_tempo;
+DELIMITER //
+CREATE FUNCTION dw.fn_sk_tempo(p_data DATE)
+RETURNS INT
+READS SQL DATA
+BEGIN
+    DECLARE v_sk INT;
+    SELECT sk_tempo INTO v_sk
+    FROM   dw.dim_tempo
+    WHERE  data = p_data
+    LIMIT  1;
+    RETURN v_sk;
+END//
 DELIMITER ;
 
--- 3) PROCEDURES DE CARGA
-DROP PROCEDURE IF EXISTS sp_popula_dim_tempo;
-DROP PROCEDURE IF EXISTS sp_garante_datas_dim_tempo;
-DROP PROCEDURE IF EXISTS sp_carga_dimensoes;
-DROP PROCEDURE IF EXISTS sp_carga_fatos;
-DROP PROCEDURE IF EXISTS sp_carga_tudo;
-
-DELIMITER $$
-
--- ---- 3.1) Pre-popula a Dim_Tempo em um intervalo de datas --------------------
-CREATE PROCEDURE sp_popula_dim_tempo(IN p_ini DATE, IN p_fim DATE)
+-- 1.2) Rede de seguranca: insere na dim_tempo qualquer data referenciada pelos
+--      fatos que esteja fora do intervalo pre-populado.
+DROP PROCEDURE IF EXISTS dw.sp_garante_dim_tempo;
+DELIMITER //
+CREATE PROCEDURE dw.sp_garante_dim_tempo(IN p_data DATE)
 BEGIN
-    DECLARE d DATE;
-    SET d = p_ini;
-    WHILE d <= p_fim DO
-        INSERT IGNORE INTO dim_tempo
-            (sk_tempo, data, ano, mes, dia, trimestre, nome_mes, dia_semana, eh_fim_de_semana)
+    IF p_data IS NOT NULL AND NOT EXISTS (SELECT 1 FROM dw.dim_tempo WHERE data = p_data) THEN
+        INSERT INTO dw.dim_tempo
+            (sk_tempo, data, ano, trimestre, mes, semana_ano, dia_semana, nome_mes, nome_dia)
         VALUES (
-            fn_sk_tempo(d), d, YEAR(d), MONTH(d), DAY(d), QUARTER(d),
-            ELT(MONTH(d), 'JANEIRO','FEVEREIRO','MARCO','ABRIL','MAIO','JUNHO',
-                          'JULHO','AGOSTO','SETEMBRO','OUTUBRO','NOVEMBRO','DEZEMBRO'),
-            ELT(DAYOFWEEK(d), 'DOMINGO','SEGUNDA','TERCA','QUARTA','QUINTA','SEXTA','SABADO'),
-            IF(DAYOFWEEK(d) IN (1, 7), 1, 0)
-        );
-        SET d = d + INTERVAL 1 DAY;
-    END WHILE;
-END$$
+            CAST(DATE_FORMAT(p_data, '%Y%m%d') AS SIGNED),
+            p_data, YEAR(p_data), QUARTER(p_data), MONTH(p_data),
+            WEEK(p_data, 3), WEEKDAY(p_data) + 1,
+            DATE_FORMAT(p_data, '%M'), DATE_FORMAT(p_data, '%W')
+        )
+        ON DUPLICATE KEY UPDATE sk_tempo = sk_tempo;
+    END IF;
+END//
+DELIMITER ;
 
--- ---- 3.2) Garante na Dim_Tempo TODA data referenciada pelos fatos -----------
--- (rede de seguranca para datas fora do intervalo pre-populado)
-CREATE PROCEDURE sp_garante_datas_dim_tempo()
+-- ============================================================================
+-- 2) CARGA DAS DIMENSOES (gera/atualiza SKs por UPSERT na Chave Natural)
+-- ============================================================================
+
+-- 2.1) Dim_Endereco (cidade/UF/pais distintos vindos de patio e cliente)
+DROP PROCEDURE IF EXISTS dw.sp_valviessejoao_carga_dim_endereco;
+DELIMITER //
+CREATE PROCEDURE dw.sp_valviessejoao_carga_dim_endereco()
 BEGIN
-    INSERT IGNORE INTO dim_tempo
-        (sk_tempo, data, ano, mes, dia, trimestre, nome_mes, dia_semana, eh_fim_de_semana)
-    SELECT fn_sk_tempo(x.d), x.d, YEAR(x.d), MONTH(x.d), DAY(x.d), QUARTER(x.d),
-           ELT(MONTH(x.d), 'JANEIRO','FEVEREIRO','MARCO','ABRIL','MAIO','JUNHO',
-                           'JULHO','AGOSTO','SETEMBRO','OUTUBRO','NOVEMBRO','DEZEMBRO'),
-           ELT(DAYOFWEEK(x.d), 'DOMINGO','SEGUNDA','TERCA','QUARTA','QUINTA','SEXTA','SABADO'),
-           IF(DAYOFWEEK(x.d) IN (1, 7), 1, 0)
-    FROM (
-        SELECT dt_retirada       AS d FROM dw_staging.trf_fato_locacao
-        UNION SELECT dt_prev_devolucao   FROM dw_staging.trf_fato_locacao
-        UNION SELECT dt_real_devolucao   FROM dw_staging.trf_fato_locacao
-        UNION SELECT dt_reserva          FROM dw_staging.trf_fato_reserva
-        UNION SELECT dt_prev_retirada    FROM dw_staging.trf_fato_reserva
-        UNION SELECT dt_prev_devolucao   FROM dw_staging.trf_fato_reserva
-        UNION SELECT dt_referencia       FROM dw_staging.trf_fato_inventario_patio
-    ) x
-    WHERE x.d IS NOT NULL;
-END$$
+    INSERT IGNORE INTO dw.dim_endereco (cidade, estado, pais)
+    SELECT DISTINCT end_cidade, end_uf, end_pais
+    FROM staging.stg_conf_patio
+    WHERE nk_frota_origem = 'valviessejoao' AND end_cidade IS NOT NULL;
 
--- ---- 3.3) Carga das DIMENSOES (gera/atualiza SKs por UPSERT na NK) ----------
-CREATE PROCEDURE sp_carga_dimensoes()
+    INSERT IGNORE INTO dw.dim_endereco (cidade, estado, pais)
+    SELECT DISTINCT end_cidade, end_uf, end_pais
+    FROM staging.stg_conf_cliente
+    WHERE nk_frota_origem = 'valviessejoao' AND end_cidade IS NOT NULL;
+END//
+DELIMITER ;
+
+-- 2.2) Dim_Patio (resolve sk_endereco; capacidade_vagas_patio = -1 nesta fonte)
+DROP PROCEDURE IF EXISTS dw.sp_valviessejoao_carga_dim_patio;
+DELIMITER //
+CREATE PROCEDURE dw.sp_valviessejoao_carga_dim_patio()
 BEGIN
-    -- Dim_Endereco (sem NK de origem; a chave e o proprio trio cidade/estado/pais)
-    INSERT IGNORE INTO dim_endereco (cidade, estado, pais)
-    SELECT cidade, estado, pais FROM dw_staging.trf_dim_endereco;
+    INSERT INTO dw.dim_patio
+        (nk_frota_origem, nk_id_patio, nome_patio, capacidade_vagas_patio, sk_endereco)
+    SELECT p.nk_frota_origem, p.nk_id_patio, p.nome_patio, p.capacidade_vagas, e.sk_endereco
+    FROM staging.stg_conf_patio p
+    LEFT JOIN dw.dim_endereco e
+        ON e.cidade = p.end_cidade AND e.estado = p.end_uf AND e.pais = p.end_pais
+    WHERE p.nk_frota_origem = 'valviessejoao'
+    ON DUPLICATE KEY UPDATE
+        nome_patio             = VALUES(nome_patio),
+        capacidade_vagas_patio = VALUES(capacidade_vagas_patio),
+        sk_endereco            = VALUES(sk_endereco);
+END//
+DELIMITER ;
 
-    -- Dim_Cliente: resolve sk_endereco por JOIN na Dim_Endereco ja carregada
-    INSERT INTO dim_cliente (nk_frota_origem, nk_id_cliente, tipo_cliente, nome, sk_endereco)
-    SELECT t.nk_frota_origem, t.nk_id_cliente, t.tipo_cliente, t.nome, e.sk_endereco
-    FROM   dw_staging.trf_dim_cliente t
-    JOIN   dim_endereco e
-           ON e.cidade = t.cidade AND e.estado = t.estado AND e.pais = t.pais
+-- 2.3) Dim_Grupo
+DROP PROCEDURE IF EXISTS dw.sp_valviessejoao_carga_dim_grupo;
+DELIMITER //
+CREATE PROCEDURE dw.sp_valviessejoao_carga_dim_grupo()
+BEGIN
+    INSERT INTO dw.dim_grupo (nk_frota_origem, nk_id_grupo, nome_grupo, valor_diaria)
+    SELECT nk_frota_origem, nk_id_grupo, nome_grupo, valor_diaria
+    FROM staging.stg_conf_grupo
+    WHERE nk_frota_origem = 'valviessejoao'
+    ON DUPLICATE KEY UPDATE
+        nome_grupo   = VALUES(nome_grupo),
+        valor_diaria = VALUES(valor_diaria);
+END//
+DELIMITER ;
+
+-- 2.4) Dim_Veiculo
+DROP PROCEDURE IF EXISTS dw.sp_valviessejoao_carga_dim_veiculo;
+DELIMITER //
+CREATE PROCEDURE dw.sp_valviessejoao_carga_dim_veiculo()
+BEGIN
+    INSERT INTO dw.dim_veiculo
+        (nk_frota_origem, nk_id_veiculo, placa, marca, modelo, mecanizacao, tem_ar_condicionado)
+    SELECT nk_frota_origem, nk_id_veiculo, placa, marca, modelo, mecanizacao, tem_ar_condicionado
+    FROM staging.stg_conf_veiculo
+    WHERE nk_frota_origem = 'valviessejoao'
+    ON DUPLICATE KEY UPDATE
+        placa               = VALUES(placa),
+        marca               = VALUES(marca),
+        modelo              = VALUES(modelo),
+        mecanizacao         = VALUES(mecanizacao),
+        tem_ar_condicionado = VALUES(tem_ar_condicionado);
+END//
+DELIMITER ;
+
+-- 2.5) Dim_Cliente (resolve sk_endereco)
+DROP PROCEDURE IF EXISTS dw.sp_valviessejoao_carga_dim_cliente;
+DELIMITER //
+CREATE PROCEDURE dw.sp_valviessejoao_carga_dim_cliente()
+BEGIN
+    INSERT INTO dw.dim_cliente
+        (nk_frota_origem, nk_id_cliente, tipo_cliente, nome, sk_endereco)
+    SELECT c.nk_frota_origem, c.nk_id_cliente, c.tipo_cliente, c.nome, e.sk_endereco
+    FROM staging.stg_conf_cliente c
+    LEFT JOIN dw.dim_endereco e
+        ON e.cidade = c.end_cidade AND e.estado = c.end_uf AND e.pais = c.end_pais
+    WHERE c.nk_frota_origem = 'valviessejoao'
     ON DUPLICATE KEY UPDATE
         tipo_cliente = VALUES(tipo_cliente),
         nome         = VALUES(nome),
         sk_endereco  = VALUES(sk_endereco);
-
-    -- Dim_Veiculo
-    INSERT INTO dim_veiculo
-        (nk_frota_origem, nk_id_veiculo, placa, marca, modelo, mecanizacao, tem_ar_condicionado)
-    SELECT nk_frota_origem, nk_id_veiculo, placa, marca, modelo, mecanizacao, tem_ar_condicionado
-    FROM   dw_staging.trf_dim_veiculo
-    ON DUPLICATE KEY UPDATE
-        placa = VALUES(placa), marca = VALUES(marca), modelo = VALUES(modelo),
-        mecanizacao = VALUES(mecanizacao), tem_ar_condicionado = VALUES(tem_ar_condicionado);
-
-    -- Dim_Grupo
-    INSERT INTO dim_grupo (nk_frota_origem, nk_id_grupo, nome_grupo, valor_diaria)
-    SELECT nk_frota_origem, nk_id_grupo, nome_grupo, valor_diaria
-    FROM   dw_staging.trf_dim_grupo
-    ON DUPLICATE KEY UPDATE
-        nome_grupo = VALUES(nome_grupo), valor_diaria = VALUES(valor_diaria);
-
-    -- Dim_Patio
-    INSERT INTO dim_patio (nk_frota_origem, nk_id_patio, nome_patio, capacidade_vagas)
-    SELECT nk_frota_origem, nk_id_patio, nome_patio, capacidade_vagas
-    FROM   dw_staging.trf_dim_patio
-    ON DUPLICATE KEY UPDATE
-        nome_patio = VALUES(nome_patio), capacidade_vagas = VALUES(capacidade_vagas);
-END$$
-
--- ---- 3.4) Carga dos FATOS (resolve todas as SKs por JOIN nas dimensoes) -----
-CREATE PROCEDURE sp_carga_fatos()
-BEGIN
-    -- ---------------------- Fato_Locacao -----------------------------------
-    -- INNER JOIN nas dimensoes obrigatorias (cliente/veiculo/grupo/patio_ret):
-    -- se alguma SK nao resolver (problema de qualidade de dado), a linha e
-    -- descartada em vez de quebrar a carga. Devolucao usa LEFT JOIN (pode ser
-    -- NULL enquanto o carro nao volta).
-    -- Registra rejeitos: FKs que não resolvem para SK
-    INSERT IGNORE INTO staging.stg_rejeitos_etl
-        (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
-    SELECT
-        'trf_fato_locacao', f.nk_frota_origem, f.nk_id_locacao,
-        CASE
-            WHEN fn_sk_tempo(f.dt_retirada) IS NULL THEN
-                CONCAT('DATA RETIRADA NÃO EM DIM_TEMPO: ', CAST(f.dt_retirada AS CHAR))
-            WHEN dc.sk_cliente IS NULL THEN
-                CONCAT('CLIENTE NÃO EM DIM_CLIENTE: nk=', CAST(f.nk_id_cliente AS CHAR))
-            WHEN dv.sk_veiculo IS NULL THEN
-                CONCAT('VEÍCULO NÃO EM DIM_VEICULO: nk=', CAST(f.nk_id_veiculo AS CHAR))
-            WHEN dg.sk_grupo IS NULL THEN
-                CONCAT('GRUPO NÃO EM DIM_GRUPO: nk=', CAST(f.nk_id_grupo AS CHAR))
-            WHEN dpr.sk_patio IS NULL THEN
-                CONCAT('PÁTIO RETIRADA NÃO EM DIM_PATIO: nk=', CAST(f.nk_id_patio_retirada AS CHAR))
-            WHEN f.nk_id_patio_devol_real IS NOT NULL AND dpd.sk_patio IS NULL THEN
-                CONCAT('PÁTIO DEVOLUÇÃO NÃO EM DIM_PATIO: nk=', CAST(f.nk_id_patio_devol_real AS CHAR))
-        END
-    FROM dw_staging.trf_fato_locacao f
-    LEFT JOIN dim_cliente dc ON dc.nk_frota_origem = f.nk_frota_origem AND dc.nk_id_cliente = f.nk_id_cliente
-    LEFT JOIN dim_veiculo dv ON dv.nk_frota_origem = f.nk_frota_origem AND dv.nk_id_veiculo = f.nk_id_veiculo
-    LEFT JOIN dim_grupo dg ON dg.nk_frota_origem = f.nk_frota_origem AND dg.nk_id_grupo = f.nk_id_grupo
-    LEFT JOIN dim_patio dpr ON dpr.nk_frota_origem = f.nk_frota_origem AND dpr.nk_id_patio = f.nk_id_patio_retirada
-    LEFT JOIN dim_patio dpd ON dpd.nk_frota_origem = f.nk_frota_origem AND dpd.nk_id_patio = f.nk_id_patio_devol_real
-    WHERE f.nk_frota_origem = 'NOVOOK'
-      AND (
-            fn_sk_tempo(f.dt_retirada) IS NULL
-         OR dc.sk_cliente IS NULL
-         OR dv.sk_veiculo IS NULL
-         OR dg.sk_grupo IS NULL
-         OR dpr.sk_patio IS NULL
-         OR (f.nk_id_patio_devol_real IS NOT NULL AND dpd.sk_patio IS NULL)
-      );
-
-    INSERT INTO fato_locacao
-        (nk_frota_origem, nk_id_locacao, sk_tempo_retirada, sk_tempo_prev_devolucao,
-         sk_tempo_real_devolucao, sk_cliente, sk_veiculo, sk_grupo, sk_patio_retirada,
-         sk_patio_devolucao_real, valor_final, qtde_locacoes)
-    SELECT f.nk_frota_origem, f.nk_id_locacao,
-           fn_sk_tempo(f.dt_retirada), fn_sk_tempo(f.dt_prev_devolucao),
-           fn_sk_tempo(f.dt_real_devolucao),
-           dc.sk_cliente, dv.sk_veiculo, dg.sk_grupo, dpr.sk_patio,
-           dpd.sk_patio, f.valor_final, 1
-    FROM   dw_staging.trf_fato_locacao f
-    JOIN   dim_cliente dc ON dc.nk_frota_origem = f.nk_frota_origem AND dc.nk_id_cliente = f.nk_id_cliente
-    JOIN   dim_veiculo dv ON dv.nk_frota_origem = f.nk_frota_origem AND dv.nk_id_veiculo = f.nk_id_veiculo
-    JOIN   dim_grupo   dg ON dg.nk_frota_origem = f.nk_frota_origem AND dg.nk_id_grupo   = f.nk_id_grupo
-    JOIN   dim_patio  dpr ON dpr.nk_frota_origem = f.nk_frota_origem AND dpr.nk_id_patio = f.nk_id_patio_retirada
-    LEFT   JOIN dim_patio dpd ON dpd.nk_frota_origem = f.nk_frota_origem AND dpd.nk_id_patio = f.nk_id_patio_devol_real
-    ON DUPLICATE KEY UPDATE
-        sk_tempo_retirada       = VALUES(sk_tempo_retirada),
-        sk_tempo_prev_devolucao = VALUES(sk_tempo_prev_devolucao),
-        sk_tempo_real_devolucao = VALUES(sk_tempo_real_devolucao),
-        sk_cliente              = VALUES(sk_cliente),
-        sk_veiculo              = VALUES(sk_veiculo),
-        sk_grupo                = VALUES(sk_grupo),
-        sk_patio_retirada       = VALUES(sk_patio_retirada),
-        sk_patio_devolucao_real = VALUES(sk_patio_devolucao_real),
-        valor_final             = VALUES(valor_final);
-
-    -- ---------------------- Fato_Reserva -----------------------------------
-    INSERT IGNORE INTO staging.stg_rejeitos_etl
-        (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
-    SELECT
-        'trf_fato_reserva', f.nk_frota_origem, f.nk_id_reserva,
-        CASE
-            WHEN fn_sk_tempo(f.dt_reserva) IS NULL THEN
-                CONCAT('DATA RESERVA NÃO EM DIM_TEMPO: ', CAST(f.dt_reserva AS CHAR))
-            WHEN dc.sk_cliente IS NULL THEN
-                CONCAT('CLIENTE NÃO EM DIM_CLIENTE: nk=', CAST(f.nk_id_cliente AS CHAR))
-            WHEN dg.sk_grupo IS NULL THEN
-                CONCAT('GRUPO NÃO EM DIM_GRUPO: nk=', CAST(f.nk_id_grupo AS CHAR))
-            WHEN dpr.sk_patio IS NULL THEN
-                CONCAT('PÁTIO RETIRADA NÃO EM DIM_PATIO: nk=', CAST(f.nk_id_patio_retirada AS CHAR))
-            WHEN dpf.sk_patio IS NULL THEN
-                CONCAT('PÁTIO FIM NÃO EM DIM_PATIO: nk=', CAST(f.nk_id_patio_fim AS CHAR))
-        END
-    FROM dw_staging.trf_fato_reserva f
-    LEFT JOIN dim_cliente dc ON dc.nk_frota_origem = f.nk_frota_origem AND dc.nk_id_cliente = f.nk_id_cliente
-    LEFT JOIN dim_grupo dg ON dg.nk_frota_origem = f.nk_frota_origem AND dg.nk_id_grupo = f.nk_id_grupo
-    LEFT JOIN dim_patio dpr ON dpr.nk_frota_origem = f.nk_frota_origem AND dpr.nk_id_patio = f.nk_id_patio_retirada
-    LEFT JOIN dim_patio dpf ON dpf.nk_frota_origem = f.nk_frota_origem AND dpf.nk_id_patio = f.nk_id_patio_fim
-    WHERE f.nk_frota_origem = 'NOVOOK'
-      AND (
-            fn_sk_tempo(f.dt_reserva) IS NULL
-         OR dc.sk_cliente IS NULL
-         OR dg.sk_grupo IS NULL
-         OR dpr.sk_patio IS NULL
-         OR dpf.sk_patio IS NULL
-      );
-
-    INSERT INTO fato_reserva
-        (nk_frota_origem, nk_id_reserva, sk_tempo_reserva, sk_tempo_prev_retirada,
-         sk_tempo_prev_devolucao, sk_cliente, sk_grupo, sk_patio_retirada, sk_patio_fim,
-         duracao_prevista_dias, valor_previsto_reserva, dd_status_reserva, qtde_reservas)
-    SELECT f.nk_frota_origem, f.nk_id_reserva,
-           fn_sk_tempo(f.dt_reserva), fn_sk_tempo(f.dt_prev_retirada),
-           fn_sk_tempo(f.dt_prev_devolucao),
-           dc.sk_cliente, dg.sk_grupo, dpr.sk_patio, dpf.sk_patio,
-           f.duracao_prevista_dias, f.valor_previsto_reserva, f.dd_status_reserva, 1
-    FROM   dw_staging.trf_fato_reserva f
-    JOIN   dim_cliente dc ON dc.nk_frota_origem = f.nk_frota_origem AND dc.nk_id_cliente = f.nk_id_cliente
-    JOIN   dim_grupo   dg ON dg.nk_frota_origem = f.nk_frota_origem AND dg.nk_id_grupo   = f.nk_id_grupo
-    JOIN   dim_patio  dpr ON dpr.nk_frota_origem = f.nk_frota_origem AND dpr.nk_id_patio = f.nk_id_patio_retirada
-    JOIN   dim_patio  dpf ON dpf.nk_frota_origem = f.nk_frota_origem AND dpf.nk_id_patio = f.nk_id_patio_fim
-    ON DUPLICATE KEY UPDATE
-        sk_tempo_reserva        = VALUES(sk_tempo_reserva),
-        sk_tempo_prev_retirada  = VALUES(sk_tempo_prev_retirada),
-        sk_tempo_prev_devolucao = VALUES(sk_tempo_prev_devolucao),
-        sk_cliente              = VALUES(sk_cliente),
-        sk_grupo                = VALUES(sk_grupo),
-        sk_patio_retirada       = VALUES(sk_patio_retirada),
-        sk_patio_fim            = VALUES(sk_patio_fim),
-        duracao_prevista_dias   = VALUES(duracao_prevista_dias),
-        valor_previsto_reserva  = VALUES(valor_previsto_reserva),
-        dd_status_reserva       = VALUES(dd_status_reserva);
-
-    -- ------------------- Fato_Inventario_Patio -----------------------------
-    INSERT IGNORE INTO staging.stg_rejeitos_etl
-        (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
-    SELECT
-        'trf_fato_inventario_patio', f.nk_frota_origem, f.nk_id_veiculo,
-        CASE
-            WHEN fn_sk_tempo(f.dt_referencia) IS NULL THEN
-                CONCAT('DATA NÃO ENCONTRADA EM DIM_TEMPO: ', CAST(f.dt_referencia AS CHAR))
-            WHEN dp.sk_patio IS NULL THEN
-                CONCAT('PÁTIO NÃO ENCONTRADO EM DIM_PATIO: nk=', CAST(f.nk_id_patio AS CHAR))
-            WHEN dv.sk_veiculo IS NULL THEN
-                CONCAT('VEÍCULO NÃO ENCONTRADO EM DIM_VEICULO: nk=', CAST(f.nk_id_veiculo AS CHAR))
-            WHEN dg.sk_grupo IS NULL THEN
-                CONCAT('GRUPO NÃO ENCONTRADO EM DIM_GRUPO: nk=', CAST(f.nk_id_grupo AS CHAR))
-        END
-    FROM dw_staging.trf_fato_inventario_patio f
-    LEFT JOIN dim_patio dp ON dp.nk_frota_origem = f.nk_frota_origem AND dp.nk_id_patio = f.nk_id_patio
-    LEFT JOIN dim_veiculo dv ON dv.nk_frota_origem = f.nk_frota_origem AND dv.nk_id_veiculo = f.nk_id_veiculo
-    LEFT JOIN dim_grupo dg ON dg.nk_frota_origem = f.nk_frota_origem AND dg.nk_id_grupo = f.nk_id_grupo
-    WHERE f.nk_frota_origem = 'NOVOOK'
-      AND (
-            fn_sk_tempo(f.dt_referencia) IS NULL
-         OR dp.sk_patio IS NULL
-         OR dv.sk_veiculo IS NULL
-         OR dg.sk_grupo IS NULL
-      );
-
-    INSERT INTO fato_inventario_patio
-        (sk_tempo_referencia, sk_patio, sk_veiculo, sk_grupo, qtde_veiculos_presentes)
-    SELECT fn_sk_tempo(f.dt_referencia), dp.sk_patio, dv.sk_veiculo, dg.sk_grupo, 1
-    FROM   dw_staging.trf_fato_inventario_patio f
-    JOIN   dim_patio   dp ON dp.nk_frota_origem = f.nk_frota_origem AND dp.nk_id_patio   = f.nk_id_patio
-    JOIN   dim_veiculo dv ON dv.nk_frota_origem = f.nk_frota_origem AND dv.nk_id_veiculo = f.nk_id_veiculo
-    LEFT   JOIN dim_grupo dg ON dg.nk_frota_origem = f.nk_frota_origem AND dg.nk_id_grupo = f.nk_id_grupo
-    ON DUPLICATE KEY UPDATE
-        sk_patio                = VALUES(sk_patio),
-        sk_grupo                = VALUES(sk_grupo),
-        qtde_veiculos_presentes = VALUES(qtde_veiculos_presentes);
-END$$
-
--- ---- 3.5) Orquestrador da carga completa ------------------------------------
-CREATE PROCEDURE sp_carga_tudo()
-BEGIN
-    -- (1) Dim_Tempo pre-populada (ajuste o intervalo conforme seus dados)
-    CALL sp_popula_dim_tempo('2023-01-01', '2027-12-31');
-    -- (2) Garante quaisquer datas extras referenciadas pelos fatos
-    CALL sp_garante_datas_dim_tempo();
-    -- (3) Dimensoes antes (precisam existir para os fatos resolverem as SKs)
-    CALL sp_carga_dimensoes();
-    -- (4) Fatos
-    CALL sp_carga_fatos();
-END$$
-
+END//
 DELIMITER ;
 
--- 4) EXECUCAO DA CARGA
+-- ============================================================================
+-- 3) CARGA DOS FATOS (garante datas na dim_tempo, registra rejeitos de FK e
+--    resolve TODAS as SKs por JOIN). INNER JOIN nas dimensoes obrigatorias:
+--    se uma SK nao resolve, a linha vira rejeito em vez de quebrar a carga.
+-- ============================================================================
 
-CALL sp_carga_tudo();
+-- 3.1) Fato_Inventario_Patio (sk_grupo é NOT NULL no DW -> JOIN obrigatorio)
+DROP PROCEDURE IF EXISTS dw.sp_valviessejoao_carga_fato_inventario_patio;
+DELIMITER //
+CREATE PROCEDURE dw.sp_valviessejoao_carga_fato_inventario_patio()
+BEGIN
+    DECLARE v_data DATE;
+    DECLARE v_done INT DEFAULT 0;
+    DECLARE cur_datas CURSOR FOR
+        SELECT DISTINCT data_snapshot
+        FROM staging.stg_conf_snapshot_patio
+        WHERE nk_frota_origem = 'valviessejoao';
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = 1;
 
+    OPEN cur_datas;
+    loop_datas: LOOP
+        FETCH cur_datas INTO v_data;
+        IF v_done THEN LEAVE loop_datas; END IF;
+        CALL dw.sp_garante_dim_tempo(v_data);
+    END LOOP;
+    CLOSE cur_datas;
+
+    INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+    SELECT 'stg_conf_snapshot_patio', s.nk_frota_origem, s.nk_id_veiculo,
+        CASE
+            WHEN dw.fn_sk_tempo(s.data_snapshot) IS NULL THEN CONCAT('DATA NÃO ENCONTRADA EM DIM_TEMPO: ', CAST(s.data_snapshot AS CHAR))
+            WHEN dp.sk_patio IS NULL THEN CONCAT('PÁTIO NÃO ENCONTRADO EM DIM_PATIO: nk=', CAST(s.nk_id_patio AS CHAR))
+            WHEN dv.sk_veiculo IS NULL THEN CONCAT('VEÍCULO NÃO ENCONTRADO EM DIM_VEICULO: nk=', CAST(s.nk_id_veiculo AS CHAR))
+            WHEN dg.sk_grupo IS NULL THEN CONCAT('GRUPO NÃO ENCONTRADO EM DIM_GRUPO: nk=', CAST(s.nk_id_grupo AS CHAR))
+        END
+    FROM staging.stg_conf_snapshot_patio s
+    LEFT JOIN dw.dim_patio   dp ON dp.nk_frota_origem = s.nk_frota_origem AND dp.nk_id_patio   = s.nk_id_patio
+    LEFT JOIN dw.dim_veiculo dv ON dv.nk_frota_origem = s.nk_frota_origem AND dv.nk_id_veiculo = s.nk_id_veiculo
+    LEFT JOIN dw.dim_grupo   dg ON dg.nk_frota_origem = s.nk_frota_origem AND dg.nk_id_grupo   = s.nk_id_grupo
+    WHERE s.nk_frota_origem = 'valviessejoao'
+      AND (dw.fn_sk_tempo(s.data_snapshot) IS NULL OR dp.sk_patio IS NULL OR dv.sk_veiculo IS NULL OR dg.sk_grupo IS NULL);
+
+    INSERT INTO dw.fato_inventario_patio
+        (sk_tempo_referencia, sk_patio, sk_veiculo, sk_grupo, qtde_veiculos_presentes)
+    SELECT dw.fn_sk_tempo(s.data_snapshot), dp.sk_patio, dv.sk_veiculo, dg.sk_grupo, 1
+    FROM staging.stg_conf_snapshot_patio s
+    JOIN dw.dim_patio   dp ON dp.nk_frota_origem = s.nk_frota_origem AND dp.nk_id_patio   = s.nk_id_patio
+    JOIN dw.dim_veiculo dv ON dv.nk_frota_origem = s.nk_frota_origem AND dv.nk_id_veiculo = s.nk_id_veiculo
+    JOIN dw.dim_grupo   dg ON dg.nk_frota_origem = s.nk_frota_origem AND dg.nk_id_grupo   = s.nk_id_grupo
+    WHERE s.nk_frota_origem = 'valviessejoao'
+      AND dw.fn_sk_tempo(s.data_snapshot) IS NOT NULL
+    ON DUPLICATE KEY UPDATE
+        sk_grupo                = VALUES(sk_grupo),
+        qtde_veiculos_presentes = VALUES(qtde_veiculos_presentes);
+END//
+DELIMITER ;
+
+-- 3.2) Fato_Locacao (patio de devolucao via LEFT JOIN: pode estar em aberto)
+DROP PROCEDURE IF EXISTS dw.sp_valviessejoao_carga_fato_locacao;
+DELIMITER //
+CREATE PROCEDURE dw.sp_valviessejoao_carga_fato_locacao()
+BEGIN
+    DECLARE v_data DATE;
+    DECLARE v_done INT DEFAULT 0;
+    DECLARE cur_datas CURSOR FOR
+        SELECT DISTINCT dt FROM (
+            SELECT data_retirada       AS dt FROM staging.stg_conf_locacao WHERE nk_frota_origem = 'valviessejoao' AND data_retirada       IS NOT NULL
+            UNION ALL
+            SELECT data_prev_devolucao AS dt FROM staging.stg_conf_locacao WHERE nk_frota_origem = 'valviessejoao' AND data_prev_devolucao IS NOT NULL
+            UNION ALL
+            SELECT data_real_devolucao AS dt FROM staging.stg_conf_locacao WHERE nk_frota_origem = 'valviessejoao' AND data_real_devolucao IS NOT NULL
+        ) all_dates;
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = 1;
+
+    OPEN cur_datas;
+    loop_datas: LOOP
+        FETCH cur_datas INTO v_data;
+        IF v_done THEN LEAVE loop_datas; END IF;
+        CALL dw.sp_garante_dim_tempo(v_data);
+    END LOOP;
+    CLOSE cur_datas;
+
+    INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+    SELECT 'stg_conf_locacao', l.nk_frota_origem, l.nk_id_locacao,
+        CASE
+            WHEN dw.fn_sk_tempo(l.data_retirada) IS NULL THEN CONCAT('DATA RETIRADA NÃO EM DIM_TEMPO: ', CAST(l.data_retirada AS CHAR))
+            WHEN dc.sk_cliente IS NULL THEN CONCAT('CLIENTE NÃO EM DIM_CLIENTE: nk=', CAST(l.nk_id_cliente AS CHAR))
+            WHEN dv.sk_veiculo IS NULL THEN CONCAT('VEÍCULO NÃO EM DIM_VEICULO: nk=', CAST(l.nk_id_veiculo AS CHAR))
+            WHEN dg.sk_grupo IS NULL THEN CONCAT('GRUPO NÃO EM DIM_GRUPO: nk=', CAST(l.nk_id_grupo AS CHAR))
+            WHEN dp_ret.sk_patio IS NULL THEN CONCAT('PÁTIO RETIRADA NÃO EM DIM_PATIO: nk=', CAST(l.nk_id_patio_retirada AS CHAR))
+        END
+    FROM staging.stg_conf_locacao l
+    LEFT JOIN dw.dim_cliente dc     ON dc.nk_frota_origem     = l.nk_frota_origem AND dc.nk_id_cliente   = l.nk_id_cliente
+    LEFT JOIN dw.dim_veiculo dv     ON dv.nk_frota_origem     = l.nk_frota_origem AND dv.nk_id_veiculo   = l.nk_id_veiculo
+    LEFT JOIN dw.dim_grupo   dg     ON dg.nk_frota_origem     = l.nk_frota_origem AND dg.nk_id_grupo     = l.nk_id_grupo
+    LEFT JOIN dw.dim_patio   dp_ret ON dp_ret.nk_frota_origem = l.nk_frota_origem AND dp_ret.nk_id_patio = l.nk_id_patio_retirada
+    WHERE l.nk_frota_origem = 'valviessejoao'
+      AND (dw.fn_sk_tempo(l.data_retirada) IS NULL OR dc.sk_cliente IS NULL OR dv.sk_veiculo IS NULL OR dg.sk_grupo IS NULL OR dp_ret.sk_patio IS NULL);
+
+    INSERT INTO dw.fato_locacao
+        (nk_frota_origem, nk_id_locacao,
+         sk_tempo_retirada, sk_tempo_prev_devolucao, sk_tempo_real_devolucao,
+         sk_cliente, sk_veiculo, sk_grupo, sk_patio_retirada, sk_patio_devolucao_real,
+         valor_final, qtde_locacoes)
+    SELECT l.nk_frota_origem, l.nk_id_locacao,
+        dw.fn_sk_tempo(l.data_retirada),
+        dw.fn_sk_tempo(l.data_prev_devolucao),
+        dw.fn_sk_tempo(l.data_real_devolucao),
+        dc.sk_cliente, dv.sk_veiculo, dg.sk_grupo, dp_ret.sk_patio, dp_dev.sk_patio,
+        COALESCE(l.valor_final, 0.00), 1
+    FROM staging.stg_conf_locacao l
+    JOIN dw.dim_cliente dc      ON dc.nk_frota_origem     = l.nk_frota_origem AND dc.nk_id_cliente   = l.nk_id_cliente
+    JOIN dw.dim_veiculo dv      ON dv.nk_frota_origem     = l.nk_frota_origem AND dv.nk_id_veiculo   = l.nk_id_veiculo
+    JOIN dw.dim_grupo   dg      ON dg.nk_frota_origem     = l.nk_frota_origem AND dg.nk_id_grupo     = l.nk_id_grupo
+    JOIN dw.dim_patio   dp_ret  ON dp_ret.nk_frota_origem = l.nk_frota_origem AND dp_ret.nk_id_patio = l.nk_id_patio_retirada
+    LEFT JOIN dw.dim_patio dp_dev ON dp_dev.nk_frota_origem = l.nk_frota_origem AND dp_dev.nk_id_patio = l.nk_id_patio_devolucao
+    WHERE l.nk_frota_origem = 'valviessejoao'
+      AND dw.fn_sk_tempo(l.data_retirada) IS NOT NULL
+    ON DUPLICATE KEY UPDATE
+        sk_tempo_real_devolucao = VALUES(sk_tempo_real_devolucao),
+        sk_patio_devolucao_real = VALUES(sk_patio_devolucao_real),
+        valor_final             = VALUES(valor_final);
+END//
+DELIMITER ;
+
+-- 3.3) Fato_Reserva
+DROP PROCEDURE IF EXISTS dw.sp_valviessejoao_carga_fato_reserva;
+DELIMITER //
+CREATE PROCEDURE dw.sp_valviessejoao_carga_fato_reserva()
+BEGIN
+    DECLARE v_data DATE;
+    DECLARE v_done INT DEFAULT 0;
+    DECLARE cur_datas CURSOR FOR
+        SELECT DISTINCT dt FROM (
+            SELECT data_reserva            AS dt FROM staging.stg_conf_reserva WHERE nk_frota_origem = 'valviessejoao' AND data_reserva            IS NOT NULL
+            UNION ALL
+            SELECT data_retirada_prevista  AS dt FROM staging.stg_conf_reserva WHERE nk_frota_origem = 'valviessejoao' AND data_retirada_prevista  IS NOT NULL
+            UNION ALL
+            SELECT data_devolucao_prevista AS dt FROM staging.stg_conf_reserva WHERE nk_frota_origem = 'valviessejoao' AND data_devolucao_prevista IS NOT NULL
+        ) all_dates;
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = 1;
+
+    OPEN cur_datas;
+    loop_datas: LOOP
+        FETCH cur_datas INTO v_data;
+        IF v_done THEN LEAVE loop_datas; END IF;
+        CALL dw.sp_garante_dim_tempo(v_data);
+    END LOOP;
+    CLOSE cur_datas;
+
+    INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+    SELECT 'stg_conf_reserva', r.nk_frota_origem, r.nk_id_reserva,
+        CASE
+            WHEN dw.fn_sk_tempo(r.data_reserva) IS NULL THEN CONCAT('DATA RESERVA NÃO EM DIM_TEMPO: ', CAST(r.data_reserva AS CHAR))
+            WHEN dc.sk_cliente IS NULL THEN CONCAT('CLIENTE NÃO EM DIM_CLIENTE: nk=', CAST(r.nk_id_cliente AS CHAR))
+            WHEN dg.sk_grupo IS NULL THEN CONCAT('GRUPO NÃO EM DIM_GRUPO: nk=', CAST(r.nk_id_grupo AS CHAR))
+            WHEN dp_ret.sk_patio IS NULL THEN CONCAT('PÁTIO RETIRADA NÃO EM DIM_PATIO: nk=', CAST(r.nk_id_patio_retirada AS CHAR))
+            WHEN dp_fim.sk_patio IS NULL THEN CONCAT('PÁTIO FIM NÃO EM DIM_PATIO: nk=', CAST(r.nk_id_patio_fim AS CHAR))
+        END
+    FROM staging.stg_conf_reserva r
+    LEFT JOIN dw.dim_cliente dc     ON dc.nk_frota_origem     = r.nk_frota_origem AND dc.nk_id_cliente   = r.nk_id_cliente
+    LEFT JOIN dw.dim_grupo   dg     ON dg.nk_frota_origem     = r.nk_frota_origem AND dg.nk_id_grupo     = r.nk_id_grupo
+    LEFT JOIN dw.dim_patio   dp_ret ON dp_ret.nk_frota_origem = r.nk_frota_origem AND dp_ret.nk_id_patio = r.nk_id_patio_retirada
+    LEFT JOIN dw.dim_patio   dp_fim ON dp_fim.nk_frota_origem = r.nk_frota_origem AND dp_fim.nk_id_patio = r.nk_id_patio_fim
+    WHERE r.nk_frota_origem = 'valviessejoao'
+      AND (dw.fn_sk_tempo(r.data_reserva) IS NULL OR dc.sk_cliente IS NULL OR dg.sk_grupo IS NULL OR dp_ret.sk_patio IS NULL OR dp_fim.sk_patio IS NULL);
+
+    INSERT INTO dw.fato_reserva
+        (nk_frota_origem, nk_id_reserva,
+         sk_tempo_reserva, sk_tempo_prev_retirada, sk_tempo_prev_devolucao,
+         sk_cliente, sk_grupo, sk_patio_retirada, sk_patio_fim,
+         duracao_prevista_dias, valor_previsto_reserva, dd_status_reserva, qtde_reservas)
+    SELECT r.nk_frota_origem, r.nk_id_reserva,
+        dw.fn_sk_tempo(r.data_reserva),
+        dw.fn_sk_tempo(r.data_retirada_prevista),
+        dw.fn_sk_tempo(r.data_devolucao_prevista),
+        dc.sk_cliente, dg.sk_grupo, dp_ret.sk_patio, dp_fim.sk_patio,
+        r.duracao_prevista_dias, COALESCE(r.valor_previsto_reserva, 0.00), r.status_reserva, 1
+    FROM staging.stg_conf_reserva r
+    JOIN dw.dim_cliente dc     ON dc.nk_frota_origem     = r.nk_frota_origem AND dc.nk_id_cliente   = r.nk_id_cliente
+    JOIN dw.dim_grupo   dg     ON dg.nk_frota_origem     = r.nk_frota_origem AND dg.nk_id_grupo     = r.nk_id_grupo
+    JOIN dw.dim_patio   dp_ret ON dp_ret.nk_frota_origem = r.nk_frota_origem AND dp_ret.nk_id_patio = r.nk_id_patio_retirada
+    JOIN dw.dim_patio   dp_fim ON dp_fim.nk_frota_origem = r.nk_frota_origem AND dp_fim.nk_id_patio = r.nk_id_patio_fim
+    WHERE r.nk_frota_origem = 'valviessejoao'
+      AND dw.fn_sk_tempo(r.data_reserva) IS NOT NULL
+    ON DUPLICATE KEY UPDATE
+        dd_status_reserva      = VALUES(dd_status_reserva),
+        valor_previsto_reserva = VALUES(valor_previsto_reserva),
+        duracao_prevista_dias  = VALUES(duracao_prevista_dias);
+END//
+DELIMITER ;
+
+-- ============================================================================
+-- 4) ORQUESTRADOR DA CARGA COMPLETA (dimensoes antes; fatos depois)
+-- ============================================================================
+DROP PROCEDURE IF EXISTS dw.sp_valviessejoao_carga_completa;
+DELIMITER //
+CREATE PROCEDURE dw.sp_valviessejoao_carga_completa()
+BEGIN
+    CALL dw.sp_valviessejoao_carga_dim_endereco();
+    CALL dw.sp_valviessejoao_carga_dim_patio();
+    CALL dw.sp_valviessejoao_carga_dim_grupo();
+    CALL dw.sp_valviessejoao_carga_dim_veiculo();
+    CALL dw.sp_valviessejoao_carga_dim_cliente();
+
+    CALL dw.sp_valviessejoao_carga_fato_inventario_patio();
+    CALL dw.sp_valviessejoao_carga_fato_locacao();
+    CALL dw.sp_valviessejoao_carga_fato_reserva();
+END//
+DELIMITER ;
+
+-- ============================================================================
+-- 5) EXECUCAO DA CARGA
+-- ============================================================================
+CALL dw.sp_valviessejoao_carga_completa();
+
+-- FIM DO SCRIPT DE CARGA (valviessejoao)
