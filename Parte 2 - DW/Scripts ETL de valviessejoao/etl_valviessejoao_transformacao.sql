@@ -4,630 +4,696 @@
 -- Giovanni Faletti Almeida (123184214)
 -- Guilherme En Shih Hu (123224674)
 -- Maria Victoria França Silva Ramos (123311073)
-
-
-USE dw_staging;
-
-DROP FUNCTION IF EXISTS fn_frota_origem;
-DROP FUNCTION IF EXISTS fn_txt_norm;
-
-DELIMITER $$
-
-CREATE FUNCTION fn_frota_origem() RETURNS VARCHAR(100)
-DETERMINISTIC NO SQL
-RETURN 'NOVOOK'$$
-
--- Normaliza texto: tira espacos, sobe para maiusculas e devolve NULL se vazio.
-CREATE FUNCTION fn_txt_norm(p VARCHAR(255)) RETURNS VARCHAR(255)
-DETERMINISTIC NO SQL
-RETURN NULLIF(TRIM(UPPER(p)), '')$$
-
-DELIMITER ;
-
--- 1) TABELAS CONFORMADAS (trf_*)  -- espelham as colunas do DW (sem as SKs,
---    que so sao geradas na Carga). Guardam as CHAVES NATURAIS (nk_*) para a
---    que so sao geradas na Carga). Guardam as CHAVES NATURAIS (nk_*) para a
---    Carga resolver as Surrogate Keys por JOIN.
+-- ============================================================================
+-- ETL valviessejoao - TRANSFORMACAO (o "T")
+-- Entrada : staging.stg_valviessejoao_*  (cru, gerado pelo 01_extracao)
+-- Saida   : staging.stg_conf_*           (conformado COMPARTILHADO do consorcio)
+-- Rejeitos: staging.stg_rejeitos_etl
+-- SGBD    : MySQL 8.x
+--
+-- Ordem de execucao do projeto:
+--   DW.sql  ->  etl_valviessejoao_extracao  ->  etl_valviessejoao_transformacao
+--           ->  etl_valviessejoao_carga
+--
+-- Convencoes do consorcio (espelha gui-hu / p-rique):
+--   * nk_frota_origem = 'valviessejoao' (handle do github; carimbado aqui).
+--   * As tabelas stg_conf_* sao COMPARTILHADAS por todas as frotas; por isso
+--     cada procedure apaga SO as suas linhas (WHERE nk_frota_origem=...) antes
+--     de reinserir, e usa CREATE TABLE IF NOT EXISTS (nao recria se ja existir).
+--   * Mapeia o esquema da fonte (id_*, cidade/estado, data_hora_*) para o
+--     contrato conformado (nk_*, end_cidade/end_uf/end_pais, data_*).
+--   * Padroniza para respeitar os CHECKs do DW (tipo_cliente PF/PJ; mecanizacao
+--     MANUAL/AUTOMATICO/NAO INFORMADO; status_reserva ATIVA/CANCELADA/CONVERTIDA;
+--     duracao>=1; valores>=0).
+--
+-- Dois mecanismos (idempotentes, coexistem):
+--   (A) Procedures sp_valviessejoao_transforma_*  -> conformacao em LOTE.
+--   (B) TRIGGERS sobre staging.stg_valviessejoao_* -> conformacao incremental.
+-- ============================================================================
 
 CREATE SCHEMA IF NOT EXISTS staging;
 
+-- ============================================================================
+-- 1) TABELAS DE REJEITOS E CONFORMADAS (compartilhadas) - garantia de existencia
+--    DDL identica a usada por gui-hu / p-rique (contrato unico do consorcio).
+-- ============================================================================
+
 CREATE TABLE IF NOT EXISTS staging.stg_rejeitos_etl (
     id_rejeito      INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    tabela_origem   VARCHAR(60)  NOT NULL,
-    nk_frota_origem VARCHAR(20)  NOT NULL,
-    nk_id_registro  INT          NOT NULL,
-    motivo_rejeito  VARCHAR(255) NOT NULL,
-    dados_json      JSON,
+    tabela_origem   VARCHAR(50)  NOT NULL,
+    nk_frota_origem VARCHAR(30),
+    nk_id_registro  INT,
+    motivo_rejeito  VARCHAR(500) NOT NULL,
+    dados_json      TEXT,
     dt_rejeito      DATETIME     NOT NULL DEFAULT NOW()
 );
 
-DROP TABLE IF EXISTS trf_fato_inventario_patio;
-DROP TABLE IF EXISTS trf_fato_reserva;
-DROP TABLE IF EXISTS trf_fato_locacao;
-DROP TABLE IF EXISTS trf_dim_patio;
-DROP TABLE IF EXISTS trf_dim_grupo;
-DROP TABLE IF EXISTS trf_dim_veiculo;
-DROP TABLE IF EXISTS trf_dim_cliente;
-DROP TABLE IF EXISTS trf_dim_endereco;
-
--- ---- Dim_Endereco: conjunto de enderecos distintos (cidade/estado/pais) -----
-CREATE TABLE trf_dim_endereco (
-    cidade  VARCHAR(100) NOT NULL,
-    estado  VARCHAR(100) NOT NULL,
-    pais    VARCHAR(100) NOT NULL,
-    PRIMARY KEY (cidade, estado, pais)
-) ENGINE=InnoDB;
-
--- ---- Dim_Cliente (carrega tambem o endereco conformado p/ resolver a FK) -----
-CREATE TABLE trf_dim_cliente (
-    nk_frota_origem VARCHAR(100) NOT NULL,
-    nk_id_cliente   INTEGER      NOT NULL,
-    tipo_cliente    VARCHAR(2),
-    nome            VARCHAR(150),
-    cidade          VARCHAR(100),
-    estado          VARCHAR(100),
-    pais            VARCHAR(100),
-    PRIMARY KEY (nk_frota_origem, nk_id_cliente)
-) ENGINE=InnoDB;
-
--- ---- Dim_Veiculo ------------------------------------------------------------
-CREATE TABLE trf_dim_veiculo (
-    nk_frota_origem     VARCHAR(100) NOT NULL,
-    nk_id_veiculo       INTEGER      NOT NULL,
-    placa               VARCHAR(10),
-    marca               VARCHAR(50),
-    modelo              VARCHAR(50),
-    mecanizacao         VARCHAR(20),
-    tem_ar_condicionado BOOLEAN,
-    PRIMARY KEY (nk_frota_origem, nk_id_veiculo)
-) ENGINE=InnoDB;
-
--- ---- Dim_Grupo --------------------------------------------------------------
-CREATE TABLE trf_dim_grupo (
-    nk_frota_origem VARCHAR(100)  NOT NULL,
-    nk_id_grupo     INTEGER       NOT NULL,
-    nome_grupo      VARCHAR(50),
-    valor_diaria    DECIMAL(10,2),
-    PRIMARY KEY (nk_frota_origem, nk_id_grupo)
-) ENGINE=InnoDB;
-
--- ---- Dim_Patio (capacidade_vagas fica NULL: a fonte NOVOOK nao a possui) -----
-CREATE TABLE trf_dim_patio (
-    nk_frota_origem  VARCHAR(100) NOT NULL,
-    nk_id_patio      INTEGER      NOT NULL,
-    nome_patio       VARCHAR(100),
-    capacidade_vagas INTEGER,                 -- sempre NULL para esta fonte
+CREATE TABLE IF NOT EXISTS staging.stg_conf_patio (
+    nk_frota_origem       VARCHAR(30)  NOT NULL,
+    nk_id_patio           INT          NOT NULL,
+    nome_patio            VARCHAR(100) NOT NULL,
+    capacidade_vagas      INT          NOT NULL,
+    end_cidade            VARCHAR(100),
+    end_uf                VARCHAR(100),
+    end_pais              VARCHAR(100),
     PRIMARY KEY (nk_frota_origem, nk_id_patio)
-) ENGINE=InnoDB;
+);
 
--- ---- Fato_Locacao (grao: 1 contrato de locacao) -----------------------------
-CREATE TABLE trf_fato_locacao (
-    nk_frota_origem         VARCHAR(100) NOT NULL,
-    nk_id_locacao           INTEGER      NOT NULL,
-    dt_retirada             DATE,
-    dt_prev_devolucao       DATE,
-    dt_real_devolucao       DATE,            -- NULL se ainda nao devolvido
-    nk_id_cliente           INTEGER,
-    nk_id_veiculo           INTEGER,
-    nk_id_grupo             INTEGER,
-    nk_id_patio_retirada    INTEGER,
-    nk_id_patio_devol_real  INTEGER,         -- NULL se ainda nao devolvido
-    valor_final             DECIMAL(10,2),   -- NULL ate a devolucao
-    qtde_locacoes           INT NOT NULL DEFAULT 1,
-    PRIMARY KEY (nk_frota_origem, nk_id_locacao)
-) ENGINE=InnoDB;
+CREATE TABLE IF NOT EXISTS staging.stg_conf_grupo (
+    nk_frota_origem       VARCHAR(30)   NOT NULL,
+    nk_id_grupo           INT           NOT NULL,
+    nome_grupo            VARCHAR(80)   NOT NULL,
+    valor_diaria          DECIMAL(12,2) NOT NULL,
+    PRIMARY KEY (nk_frota_origem, nk_id_grupo)
+);
 
--- ---- Fato_Reserva (grao: 1 intencao de reserva) -----------------------------
-CREATE TABLE trf_fato_reserva (
-    nk_frota_origem        VARCHAR(100) NOT NULL,
-    nk_id_reserva          INTEGER      NOT NULL,
-    dt_reserva             DATE,
-    dt_prev_retirada       DATE,
-    dt_prev_devolucao      DATE,
-    nk_id_cliente          INTEGER,
-    nk_id_grupo            INTEGER,
-    nk_id_patio_retirada   INTEGER,
-    nk_id_patio_fim        INTEGER,
-    duracao_prevista_dias  INT,
-    valor_previsto_reserva DECIMAL(10,2),
-    dd_status_reserva      VARCHAR(100),     -- dimensao degenerada
-    qtde_reservas          INT NOT NULL DEFAULT 1,
+CREATE TABLE IF NOT EXISTS staging.stg_conf_veiculo (
+    nk_frota_origem       VARCHAR(30)  NOT NULL,
+    nk_id_veiculo         INT          NOT NULL,
+    nk_id_grupo           INT          NOT NULL,
+    nk_id_patio_origem    INT,
+    placa                 VARCHAR(10)  NOT NULL,
+    marca                 VARCHAR(50)  NOT NULL,
+    modelo                VARCHAR(60)  NOT NULL,
+    mecanizacao           VARCHAR(20)  NOT NULL,
+    tem_ar_condicionado   TINYINT(1)   NOT NULL,
+    PRIMARY KEY (nk_frota_origem, nk_id_veiculo)
+);
+
+CREATE TABLE IF NOT EXISTS staging.stg_conf_cliente (
+    nk_frota_origem       VARCHAR(30)  NOT NULL,
+    nk_id_cliente         INT          NOT NULL,
+    tipo_cliente          VARCHAR(2)   NOT NULL,
+    nome                  VARCHAR(150) NOT NULL,
+    end_cidade            VARCHAR(100),
+    end_uf                VARCHAR(100),
+    end_pais              VARCHAR(100),
+    PRIMARY KEY (nk_frota_origem, nk_id_cliente)
+);
+
+CREATE TABLE IF NOT EXISTS staging.stg_conf_reserva (
+    nk_frota_origem           VARCHAR(30)   NOT NULL,
+    nk_id_reserva             INT           NOT NULL,
+    nk_id_cliente             INT           NOT NULL,
+    nk_id_grupo               INT           NOT NULL,
+    nk_id_patio_retirada      INT           NOT NULL,
+    nk_id_patio_fim           INT           NOT NULL,
+    data_reserva              DATE          NOT NULL,
+    data_retirada_prevista    DATE          NOT NULL,
+    data_devolucao_prevista   DATE          NOT NULL,
+    duracao_prevista_dias     INT           NOT NULL,
+    valor_previsto_reserva    DECIMAL(12,2) NOT NULL,
+    status_reserva            VARCHAR(100)  NOT NULL,
     PRIMARY KEY (nk_frota_origem, nk_id_reserva)
-) ENGINE=InnoDB;
+);
 
--- ---- Fato_Inventario_Patio (grao: 1 veiculo presente por dia) ---------------
-CREATE TABLE trf_fato_inventario_patio (
-    nk_frota_origem          VARCHAR(100) NOT NULL,
-    dt_referencia            DATE         NOT NULL,
-    nk_id_patio              INTEGER      NOT NULL,
-    nk_id_veiculo            INTEGER      NOT NULL,
-    nk_id_grupo              INTEGER,
-    qtde_veiculos_presentes  INT NOT NULL DEFAULT 1,
-    PRIMARY KEY (nk_frota_origem, dt_referencia, nk_id_veiculo)
-) ENGINE=InnoDB;
+CREATE TABLE IF NOT EXISTS staging.stg_conf_locacao (
+    nk_frota_origem           VARCHAR(30)   NOT NULL,
+    nk_id_locacao             INT           NOT NULL,
+    nk_id_cliente             INT           NOT NULL,
+    nk_id_veiculo             INT           NOT NULL,
+    nk_id_grupo               INT           NOT NULL,
+    nk_id_patio_retirada      INT           NOT NULL,
+    nk_id_patio_devolucao     INT,
+    data_retirada             DATE          NOT NULL,
+    data_prev_devolucao       DATE          NOT NULL,
+    data_real_devolucao       DATE,
+    valor_final               DECIMAL(14,2) NOT NULL,
+    PRIMARY KEY (nk_frota_origem, nk_id_locacao)
+);
 
--- 2) TRANSFORMACAO EM LOTE (procedures)
+CREATE TABLE IF NOT EXISTS staging.stg_conf_snapshot_patio (
+    nk_frota_origem       VARCHAR(30)  NOT NULL,
+    nk_id_patio           INT          NOT NULL,
+    nk_id_veiculo         INT          NOT NULL,
+    nk_id_grupo           INT          NOT NULL,
+    data_snapshot         DATE         NOT NULL,
+    PRIMARY KEY (nk_frota_origem, nk_id_patio, nk_id_veiculo, data_snapshot)
+);
 
-DROP PROCEDURE IF EXISTS sp_transforma_dimensoes;
-DROP PROCEDURE IF EXISTS sp_transforma_locacoes;
-DROP PROCEDURE IF EXISTS sp_transforma_reservas;
-DROP PROCEDURE IF EXISTS sp_transforma_inventario;
-DROP PROCEDURE IF EXISTS sp_transforma_tudo;
+-- ============================================================================
+-- 2) PROCEDURES DE TRANSFORMACAO (conformacao em LOTE / backfill)
+-- ============================================================================
 
-DELIMITER $$
-
--- ---- 2.1) Dimensoes ----------------------------------------------------------
-CREATE PROCEDURE sp_transforma_dimensoes()
+-- ---- 2.1) Patio -------------------------------------------------------------
+-- A fonte valviessejoao NAO possui capacidade de vagas nem cidade/UF do patio
+-- (apenas 'localizacao' livre); por isso capacidade = -1 (sentinela) e endereco
+-- = NAO INFORMADO/XX/Brasil.
+DROP PROCEDURE IF EXISTS staging.sp_valviessejoao_transforma_patio;
+DELIMITER //
+CREATE PROCEDURE staging.sp_valviessejoao_transforma_patio()
 BEGIN
-    -- Dim_Endereco: enderecos distintos e conformados a partir dos clientes.
-    -- Enderecos incompletos viram rotulos padrao (evita "buracos" na dimensao).
-    INSERT IGNORE INTO trf_dim_endereco (cidade, estado, pais)
-    SELECT DISTINCT
-           COALESCE(fn_txt_norm(c.cidade), 'NAO INFORMADO') AS cidade,
-           COALESCE(fn_txt_norm(c.estado), 'NI')            AS estado,
-           'BRASIL'                                         AS pais
-    FROM   stg_cliente c;
+    DELETE FROM staging.stg_conf_patio WHERE nk_frota_origem = 'valviessejoao';
 
-    -- Dim_Cliente (guarda o endereco conformado p/ a Carga resolver sk_endereco)
-    INSERT INTO trf_dim_cliente
-        (nk_frota_origem, nk_id_cliente, tipo_cliente, nome, cidade, estado, pais)
-    SELECT fn_frota_origem(), c.id_cliente,
-           fn_txt_norm(c.tipo_cliente),
-           TRIM(c.nome_razao_social),
-           COALESCE(fn_txt_norm(c.cidade), 'NAO INFORMADO'),
-           COALESCE(fn_txt_norm(c.estado), 'NI'),
-           'BRASIL'
-    FROM   stg_cliente c
-    ON DUPLICATE KEY UPDATE
-        tipo_cliente = VALUES(tipo_cliente),
-        nome         = VALUES(nome),
-        cidade       = VALUES(cidade),
-        estado       = VALUES(estado),
-        pais         = VALUES(pais);
+    INSERT INTO staging.stg_conf_patio
+        (nk_frota_origem, nk_id_patio, nome_patio, capacidade_vagas, end_cidade, end_uf, end_pais)
+    SELECT 'valviessejoao', p.id_patio,
+        CONCAT(UPPER(LEFT(TRIM(COALESCE(p.nome_patio, CONCAT('PATIO ', p.id_patio))), 1)),
+               LOWER(SUBSTRING(TRIM(COALESCE(p.nome_patio, CONCAT('PATIO ', p.id_patio))), 2))),
+        -1,
+        'NÃO INFORMADO', 'XX', 'Brasil'
+    FROM staging.stg_valviessejoao_patio p;
+END//
+DELIMITER ;
 
-    -- Dim_Veiculo
-    INSERT INTO trf_dim_veiculo
-        (nk_frota_origem, nk_id_veiculo, placa, marca, modelo,
-         mecanizacao, tem_ar_condicionado)
-    SELECT fn_frota_origem(), v.id_veiculo,
-           fn_txt_norm(v.placa), TRIM(v.marca), TRIM(v.modelo),
-           fn_txt_norm(v.mecanizacao), v.ar_condicionado
-    FROM   stg_veiculo v
-    ON DUPLICATE KEY UPDATE
-        placa               = VALUES(placa),
-        marca               = VALUES(marca),
-        modelo              = VALUES(modelo),
-        mecanizacao         = VALUES(mecanizacao),
-        tem_ar_condicionado = VALUES(tem_ar_condicionado);
-
-    -- Dim_Grupo (faixa_valor_diaria -> valor_diaria)
-    INSERT INTO trf_dim_grupo
-        (nk_frota_origem, nk_id_grupo, nome_grupo, valor_diaria)
-    SELECT fn_frota_origem(), g.id_grupo, TRIM(g.nome_grupo), g.faixa_valor_diaria
-    FROM   stg_grupo g
-    ON DUPLICATE KEY UPDATE
-        nome_grupo   = VALUES(nome_grupo),
-        valor_diaria = VALUES(valor_diaria);
-
-    -- Dim_Patio (capacidade_vagas = NULL: ausente na fonte)
-    INSERT INTO trf_dim_patio
-        (nk_frota_origem, nk_id_patio, nome_patio, capacidade_vagas)
-    SELECT fn_frota_origem(), p.id_patio, TRIM(p.nome_patio), NULL
-    FROM   stg_patio p
-    ON DUPLICATE KEY UPDATE
-        nome_patio       = VALUES(nome_patio),
-        capacidade_vagas = VALUES(capacidade_vagas);
-END$$
-
--- ---- 2.2) Fato_Locacao -------------------------------------------------------
-CREATE PROCEDURE sp_transforma_locacoes()
+-- ---- 2.2) Grupo -------------------------------------------------------------
+DROP PROCEDURE IF EXISTS staging.sp_valviessejoao_transforma_grupo;
+DELIMITER //
+CREATE PROCEDURE staging.sp_valviessejoao_transforma_grupo()
 BEGIN
-    INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
-    SELECT 'stg_locacao', fn_frota_origem(), l.id_locacao,
+    DELETE FROM staging.stg_conf_grupo WHERE nk_frota_origem = 'valviessejoao';
+
+    -- DQ: grupo sem tarifa vigente (sera carregado com 0,00)
+    INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+    SELECT 'stg_valviessejoao_grupo', 'valviessejoao', g.id_grupo,
+           'Grupo sem valor_diaria vigente; será carregado com valor 0,00'
+    FROM staging.stg_valviessejoao_grupo g
+    WHERE g.faixa_valor_diaria IS NULL OR g.faixa_valor_diaria = 0;
+
+    INSERT INTO staging.stg_conf_grupo (nk_frota_origem, nk_id_grupo, nome_grupo, valor_diaria)
+    SELECT 'valviessejoao', g.id_grupo,
+        CONCAT(UPPER(LEFT(TRIM(COALESCE(g.nome_grupo, CONCAT('GRUPO ', g.id_grupo))), 1)),
+               LOWER(SUBSTRING(TRIM(COALESCE(g.nome_grupo, CONCAT('GRUPO ', g.id_grupo))), 2))),
+        COALESCE(g.faixa_valor_diaria, 0)
+    FROM staging.stg_valviessejoao_grupo g;
+END//
+DELIMITER ;
+
+-- ---- 2.3) Veiculo -----------------------------------------------------------
+DROP PROCEDURE IF EXISTS staging.sp_valviessejoao_transforma_veiculo;
+DELIMITER //
+CREATE PROCEDURE staging.sp_valviessejoao_transforma_veiculo()
+BEGIN
+    DELETE FROM staging.stg_conf_veiculo WHERE nk_frota_origem = 'valviessejoao';
+
+    -- DQ: veiculo sem grupo (FK obrigatoria no conformado e no DW)
+    INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+    SELECT 'stg_valviessejoao_veiculo', 'valviessejoao', v.id_veiculo, 'Veículo sem id_grupo'
+    FROM staging.stg_valviessejoao_veiculo v
+    WHERE v.id_grupo IS NULL;
+
+    INSERT INTO staging.stg_conf_veiculo
+        (nk_frota_origem, nk_id_veiculo, nk_id_grupo, nk_id_patio_origem,
+         placa, marca, modelo, mecanizacao, tem_ar_condicionado)
+    SELECT 'valviessejoao', v.id_veiculo, v.id_grupo, v.id_patio_atual,
+        COALESCE(NULLIF(UPPER(TRIM(v.placa)), ''), 'SEM PLACA'),
+        CONCAT(UPPER(LEFT(TRIM(COALESCE(v.marca, 'NÃO INFORMADO')), 1)),
+               LOWER(SUBSTRING(TRIM(COALESCE(v.marca, 'NÃO INFORMADO')), 2))),
+        CONCAT(UPPER(LEFT(TRIM(COALESCE(v.modelo, 'NÃO INFORMADO')), 1)),
+               LOWER(SUBSTRING(TRIM(COALESCE(v.modelo, 'NÃO INFORMADO')), 2))),
         CASE
-            WHEN l.id_cliente IS NULL         THEN 'Locação sem cliente'
-            WHEN l.id_veiculo IS NULL         THEN 'Locação sem veículo'
-            WHEN l.id_grupo IS NULL           THEN 'Locação sem grupo'
-            WHEN l.id_patio_retirada IS NULL  THEN 'Locação sem pátio de retirada'
+            WHEN UPPER(TRIM(COALESCE(v.mecanizacao, ''))) IN ('MANUAL') THEN 'MANUAL'
+            WHEN UPPER(TRIM(COALESCE(v.mecanizacao, ''))) IN ('AUTOMATICO', 'AUTOMÁTICO', 'AUTOMATICA', 'AUTOMÁTICA') THEN 'AUTOMATICO'
+            ELSE 'NÃO INFORMADO'
+        END,
+        COALESCE(v.ar_condicionado, FALSE)
+    FROM staging.stg_valviessejoao_veiculo v
+    WHERE v.id_grupo IS NOT NULL;
+END//
+DELIMITER ;
+
+-- ---- 2.4) Cliente -----------------------------------------------------------
+DROP PROCEDURE IF EXISTS staging.sp_valviessejoao_transforma_cliente;
+DELIMITER //
+CREATE PROCEDURE staging.sp_valviessejoao_transforma_cliente()
+BEGIN
+    DELETE FROM staging.stg_conf_cliente WHERE nk_frota_origem = 'valviessejoao';
+
+    -- DQ: tipo_cliente fora de PF/PJ (CHECK do DW)
+    INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+    SELECT 'stg_valviessejoao_cliente', 'valviessejoao', c.id_cliente, 'Cliente sem tipo_cliente válido (PF/PJ)'
+    FROM staging.stg_valviessejoao_cliente c
+    WHERE UPPER(TRIM(COALESCE(c.tipo_cliente, ''))) NOT IN ('PF', 'PJ');
+
+    INSERT INTO staging.stg_conf_cliente
+        (nk_frota_origem, nk_id_cliente, tipo_cliente, nome, end_cidade, end_uf, end_pais)
+    SELECT 'valviessejoao', c.id_cliente,
+        UPPER(TRIM(c.tipo_cliente)),
+        CONCAT(UPPER(LEFT(TRIM(COALESCE(c.nome_razao_social, 'NÃO IDENTIFICADO')), 1)),
+               LOWER(SUBSTRING(TRIM(COALESCE(c.nome_razao_social, 'NÃO IDENTIFICADO')), 2))),
+        COALESCE(NULLIF(TRIM(c.cidade), ''), 'NÃO INFORMADO'),
+        COALESCE(NULLIF(TRIM(c.estado), ''), 'XX'),
+        'Brasil'
+    FROM staging.stg_valviessejoao_cliente c
+    WHERE UPPER(TRIM(COALESCE(c.tipo_cliente, ''))) IN ('PF', 'PJ');
+END//
+DELIMITER ;
+
+-- ---- 2.5) Reserva (calcula duracao e valor previsto) ------------------------
+DROP PROCEDURE IF EXISTS staging.sp_valviessejoao_transforma_reserva;
+DELIMITER //
+CREATE PROCEDURE staging.sp_valviessejoao_transforma_reserva()
+BEGIN
+    DELETE FROM staging.stg_conf_reserva WHERE nk_frota_origem = 'valviessejoao';
+
+    -- DQ: chaves/datas ausentes ou janela invalida
+    INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
+    SELECT 'stg_valviessejoao_reserva', 'valviessejoao', r.id_reserva,
+        CASE
+            WHEN r.id_cliente IS NULL THEN 'Reserva sem cliente'
+            WHEN r.id_grupo IS NULL THEN 'Reserva sem grupo'
+            WHEN r.id_patio_retirada IS NULL THEN 'Reserva sem pátio de retirada'
+            WHEN r.id_patio_devolucao_previsto IS NULL THEN 'Reserva sem pátio de fim'
+            WHEN r.data_reserva IS NULL THEN 'Reserva sem data de reserva'
+            WHEN r.data_prev_retirada IS NULL THEN 'Reserva sem data de retirada prevista'
+            WHEN r.data_prev_devolucao IS NULL THEN 'Reserva sem data de devolução prevista'
+            WHEN r.data_prev_devolucao <= r.data_prev_retirada THEN 'Data devolução <= data retirada (duração < 1)'
+            ELSE 'Erro desconhecido'
+        END,
+        JSON_OBJECT('nk_id_reserva', r.id_reserva, 'nk_id_cliente', r.id_cliente, 'nk_id_grupo', r.id_grupo,
+                    'nk_id_patio_retirada', r.id_patio_retirada, 'nk_id_patio_fim', r.id_patio_devolucao_previsto,
+                    'data_reserva', r.data_reserva, 'data_retirada_prevista', r.data_prev_retirada,
+                    'data_devolucao_prevista', r.data_prev_devolucao)
+    FROM staging.stg_valviessejoao_reserva r
+    WHERE r.id_cliente IS NULL OR r.id_grupo IS NULL OR r.id_patio_retirada IS NULL
+       OR r.id_patio_devolucao_previsto IS NULL OR r.data_reserva IS NULL
+       OR r.data_prev_retirada IS NULL OR r.data_prev_devolucao IS NULL
+       OR r.data_prev_devolucao <= r.data_prev_retirada;
+
+    INSERT INTO staging.stg_conf_reserva
+        (nk_frota_origem, nk_id_reserva, nk_id_cliente, nk_id_grupo, nk_id_patio_retirada, nk_id_patio_fim,
+         data_reserva, data_retirada_prevista, data_devolucao_prevista,
+         duracao_prevista_dias, valor_previsto_reserva, status_reserva)
+    SELECT 'valviessejoao', r.id_reserva, r.id_cliente, r.id_grupo, r.id_patio_retirada, r.id_patio_devolucao_previsto,
+        r.data_reserva, r.data_prev_retirada, r.data_prev_devolucao,
+        DATEDIFF(r.data_prev_devolucao, r.data_prev_retirada),
+        DATEDIFF(r.data_prev_devolucao, r.data_prev_retirada) * COALESCE(g.faixa_valor_diaria, 0),
+        CASE UPPER(TRIM(COALESCE(r.status_reserva, '')))
+            WHEN 'ATIVA' THEN 'ATIVA'
+            WHEN 'CANCELADA' THEN 'CANCELADA'
+            WHEN 'CONVERTIDA' THEN 'CONVERTIDA'
+            ELSE 'ATIVA'
+        END
+    FROM staging.stg_valviessejoao_reserva r
+    LEFT JOIN staging.stg_valviessejoao_grupo g ON g.id_grupo = r.id_grupo
+    WHERE r.id_cliente IS NOT NULL AND r.id_grupo IS NOT NULL AND r.id_patio_retirada IS NOT NULL
+      AND r.id_patio_devolucao_previsto IS NOT NULL AND r.data_reserva IS NOT NULL
+      AND r.data_prev_retirada IS NOT NULL AND r.data_prev_devolucao IS NOT NULL
+      AND r.data_prev_devolucao > r.data_prev_retirada;
+END//
+DELIMITER ;
+
+-- ---- 2.6) Locacao -----------------------------------------------------------
+DROP PROCEDURE IF EXISTS staging.sp_valviessejoao_transforma_locacao;
+DELIMITER //
+CREATE PROCEDURE staging.sp_valviessejoao_transforma_locacao()
+BEGIN
+    DELETE FROM staging.stg_conf_locacao WHERE nk_frota_origem = 'valviessejoao';
+
+    -- DQ: chaves/datas ausentes ou devolucao real anterior a retirada
+    INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
+    SELECT 'stg_valviessejoao_locacao', 'valviessejoao', l.id_locacao,
+        CASE
+            WHEN l.id_cliente IS NULL THEN 'Locação sem cliente'
+            WHEN l.id_veiculo IS NULL THEN 'Locação sem veículo'
+            WHEN l.id_grupo IS NULL THEN 'Locação sem grupo'
+            WHEN l.id_patio_retirada IS NULL THEN 'Locação sem pátio de retirada'
             WHEN l.data_hora_retirada IS NULL THEN 'Locação sem data de retirada'
             WHEN l.data_hora_prev_devolucao IS NULL THEN 'Locação sem data prev. devolução'
             WHEN l.data_hora_real_devolucao IS NOT NULL AND DATE(l.data_hora_real_devolucao) < DATE(l.data_hora_retirada) THEN 'Data devolução real anterior à retirada'
             ELSE 'Erro desconhecido'
         END,
-        JSON_OBJECT('nk_id_locacao', l.id_locacao, 'nk_id_cliente', l.id_cliente, 'nk_id_veiculo', l.id_veiculo, 'nk_id_grupo', l.id_grupo, 'nk_id_patio_retirada', l.id_patio_retirada, 'data_retirada', l.data_hora_retirada, 'data_prev_devolucao', l.data_hora_prev_devolucao, 'data_real_devolucao', l.data_hora_real_devolucao, 'valor_final', l.valor_final)
-    FROM stg_locacao l
-    WHERE l.id_cliente IS NULL OR l.id_veiculo IS NULL OR l.id_grupo IS NULL OR l.id_patio_retirada IS NULL OR l.data_hora_retirada IS NULL OR l.data_hora_prev_devolucao IS NULL OR (l.data_hora_real_devolucao IS NOT NULL AND DATE(l.data_hora_real_devolucao) < DATE(l.data_hora_retirada));
+        JSON_OBJECT('nk_id_locacao', l.id_locacao, 'nk_id_cliente', l.id_cliente, 'nk_id_veiculo', l.id_veiculo,
+                    'nk_id_grupo', l.id_grupo, 'nk_id_patio_retirada', l.id_patio_retirada,
+                    'data_retirada', l.data_hora_retirada, 'data_prev_devolucao', l.data_hora_prev_devolucao,
+                    'data_real_devolucao', l.data_hora_real_devolucao, 'valor_final', l.valor_final)
+    FROM staging.stg_valviessejoao_locacao l
+    WHERE l.id_cliente IS NULL OR l.id_veiculo IS NULL OR l.id_grupo IS NULL OR l.id_patio_retirada IS NULL
+       OR l.data_hora_retirada IS NULL OR l.data_hora_prev_devolucao IS NULL
+       OR (l.data_hora_real_devolucao IS NOT NULL AND DATE(l.data_hora_real_devolucao) < DATE(l.data_hora_retirada));
 
-    INSERT INTO trf_fato_locacao
-        (nk_frota_origem, nk_id_locacao, dt_retirada, dt_prev_devolucao,
-         dt_real_devolucao, nk_id_cliente, nk_id_veiculo, nk_id_grupo,
-         nk_id_patio_retirada, nk_id_patio_devol_real, valor_final, qtde_locacoes)
-    SELECT fn_frota_origem(), l.id_locacao,
-           DATE(l.data_hora_retirada),
-           DATE(l.data_hora_prev_devolucao),
-           DATE(l.data_hora_real_devolucao),   -- NULL se ainda nao devolvido
-           l.id_cliente, l.id_veiculo, l.id_grupo,
-           l.id_patio_retirada, l.id_patio_devolucao_real,
-           l.valor_final, 1
-    FROM   stg_locacao l
-    ON DUPLICATE KEY UPDATE
-        dt_retirada            = VALUES(dt_retirada),
-        dt_prev_devolucao      = VALUES(dt_prev_devolucao),
-        dt_real_devolucao      = VALUES(dt_real_devolucao),
-        nk_id_cliente          = VALUES(nk_id_cliente),
-        nk_id_veiculo          = VALUES(nk_id_veiculo),
-        nk_id_grupo            = VALUES(nk_id_grupo),
-        nk_id_patio_retirada   = VALUES(nk_id_patio_retirada),
-        nk_id_patio_devol_real = VALUES(nk_id_patio_devol_real),
-        valor_final            = VALUES(valor_final);
-END$$
-
--- ---- 2.3) Fato_Reserva (calcula duracao e valor previsto) --------------------
-CREATE PROCEDURE sp_transforma_reservas()
-BEGIN
-    INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
-    SELECT 'stg_reserva', fn_frota_origem(), r.id_reserva,
-        CASE
-            WHEN r.id_cliente IS NULL            THEN 'Reserva sem cliente'
-            WHEN r.id_grupo IS NULL              THEN 'Reserva sem grupo'
-            WHEN r.id_patio_retirada IS NULL     THEN 'Reserva sem pátio de retirada'
-            WHEN r.id_patio_devolucao_previsto IS NULL THEN 'Reserva sem pátio de fim'
-            WHEN r.data_reserva IS NULL             THEN 'Reserva sem data de reserva'
-            WHEN r.data_prev_retirada IS NULL   THEN 'Reserva sem data de retirada prevista'
-            WHEN r.data_prev_devolucao IS NULL  THEN 'Reserva sem data de devolução prevista'
-            WHEN r.data_prev_devolucao <= r.data_prev_retirada THEN 'Data devolução <= data retirada'
-            ELSE 'Erro desconhecido'
-        END,
-        JSON_OBJECT('nk_id_reserva', r.id_reserva, 'nk_id_cliente', r.id_cliente, 'nk_id_grupo', r.id_grupo, 'nk_id_patio_retirada', r.id_patio_retirada, 'nk_id_patio_fim', r.id_patio_devolucao_previsto, 'data_reserva', r.data_reserva, 'data_retirada_prevista', r.data_prev_retirada, 'data_devolucao_prevista', r.data_prev_devolucao)
-    FROM stg_reserva r
-    WHERE r.id_cliente IS NULL OR r.id_grupo IS NULL OR r.id_patio_retirada IS NULL OR r.id_patio_devolucao_previsto IS NULL OR r.data_reserva IS NULL OR r.data_prev_retirada IS NULL OR r.data_prev_devolucao IS NULL OR r.data_prev_devolucao <= r.data_prev_retirada;
-
-    INSERT INTO trf_fato_reserva
-        (nk_frota_origem, nk_id_reserva, dt_reserva, dt_prev_retirada,
-         dt_prev_devolucao, nk_id_cliente, nk_id_grupo, nk_id_patio_retirada,
-         nk_id_patio_fim, duracao_prevista_dias, valor_previsto_reserva,
-         dd_status_reserva, qtde_reservas)
-    SELECT fn_frota_origem(), r.id_reserva,
-           r.data_reserva, r.data_prev_retirada, r.data_prev_devolucao,
-           r.id_cliente, r.id_grupo, r.id_patio_retirada,
-           r.id_patio_devolucao_previsto,
-           DATEDIFF(r.data_prev_devolucao, r.data_prev_retirada) AS duracao,
-           -- valor previsto = dias previstos * diaria do grupo reservado
-           DATEDIFF(r.data_prev_devolucao, r.data_prev_retirada)
-               * COALESCE(g.faixa_valor_diaria, 0)            AS valor_previsto,
-           fn_txt_norm(r.status_reserva), 1
-    FROM   stg_reserva r
-    LEFT   JOIN stg_grupo g ON g.id_grupo = r.id_grupo
-    ON DUPLICATE KEY UPDATE
-        dt_reserva             = VALUES(dt_reserva),
-        dt_prev_retirada       = VALUES(dt_prev_retirada),
-        dt_prev_devolucao      = VALUES(dt_prev_devolucao),
-        nk_id_cliente          = VALUES(nk_id_cliente),
-        nk_id_grupo            = VALUES(nk_id_grupo),
-        nk_id_patio_retirada   = VALUES(nk_id_patio_retirada),
-        nk_id_patio_fim        = VALUES(nk_id_patio_fim),
-        duracao_prevista_dias  = VALUES(duracao_prevista_dias),
-        valor_previsto_reserva = VALUES(valor_previsto_reserva),
-        dd_status_reserva      = VALUES(dd_status_reserva);
-END$$
-
--- ---- 2.4) Fato_Inventario_Patio ---------------------------------------------
-CREATE PROCEDURE sp_transforma_inventario()
-BEGIN
-    INSERT INTO trf_fato_inventario_patio
-        (nk_frota_origem, dt_referencia, nk_id_patio, nk_id_veiculo,
-         nk_id_grupo, qtde_veiculos_presentes)
-    SELECT fn_frota_origem(), i.data_snapshot, i.id_patio, i.id_veiculo,
-           i.id_grupo, 1
-    FROM   stg_inventario_patio i
-    ON DUPLICATE KEY UPDATE
-        nk_id_patio             = VALUES(nk_id_patio),
-        nk_id_grupo             = VALUES(nk_id_grupo),
-        qtde_veiculos_presentes = VALUES(qtde_veiculos_presentes);
-END$$
-
--- ---- 2.5) Orquestrador -------------------------------------------------------
-CREATE PROCEDURE sp_transforma_tudo()
-BEGIN
-    CALL sp_transforma_dimensoes();
-    CALL sp_transforma_locacoes();
-    CALL sp_transforma_reservas();
-    CALL sp_transforma_inventario();
-END$$
-
+    INSERT INTO staging.stg_conf_locacao
+        (nk_frota_origem, nk_id_locacao, nk_id_cliente, nk_id_veiculo, nk_id_grupo,
+         nk_id_patio_retirada, nk_id_patio_devolucao, data_retirada, data_prev_devolucao,
+         data_real_devolucao, valor_final)
+    SELECT 'valviessejoao', l.id_locacao, l.id_cliente, l.id_veiculo, l.id_grupo,
+        l.id_patio_retirada, l.id_patio_devolucao_real,
+        DATE(l.data_hora_retirada), DATE(l.data_hora_prev_devolucao), DATE(l.data_hora_real_devolucao),
+        GREATEST(COALESCE(l.valor_final, 0), 0)
+    FROM staging.stg_valviessejoao_locacao l
+    WHERE l.id_cliente IS NOT NULL AND l.id_veiculo IS NOT NULL AND l.id_grupo IS NOT NULL
+      AND l.id_patio_retirada IS NOT NULL AND l.data_hora_retirada IS NOT NULL
+      AND l.data_hora_prev_devolucao IS NOT NULL
+      AND (l.data_hora_real_devolucao IS NULL OR DATE(l.data_hora_real_devolucao) >= DATE(l.data_hora_retirada));
+END//
 DELIMITER ;
 
--- 3) TRANSFORMACAO INCREMENTAL (TRIGGERS sobre o staging cru)
---    Cada vez que a EXTRACAO grava em stg_*, estes triggers conformam a linha
---    e fazem UPSERT em trf_*. Assim o "T" acontece junto do "E", em tempo real.
---    (Mesma logica das procedures, porem linha a linha.)
-
-DROP TRIGGER IF EXISTS trg_trf_cliente_ai;
-DROP TRIGGER IF EXISTS trg_trf_cliente_au;
-DROP TRIGGER IF EXISTS trg_trf_veiculo_ai;
-DROP TRIGGER IF EXISTS trg_trf_veiculo_au;
-DROP TRIGGER IF EXISTS trg_trf_grupo_ai;
-DROP TRIGGER IF EXISTS trg_trf_grupo_au;
-DROP TRIGGER IF EXISTS trg_trf_patio_ai;
-DROP TRIGGER IF EXISTS trg_trf_patio_au;
-DROP TRIGGER IF EXISTS trg_trf_reserva_ai;
-DROP TRIGGER IF EXISTS trg_trf_reserva_au;
-DROP TRIGGER IF EXISTS trg_trf_locacao_ai;
-DROP TRIGGER IF EXISTS trg_trf_locacao_au;
-DROP TRIGGER IF EXISTS trg_trf_inventario_ai;
-DROP TRIGGER IF EXISTS trg_trf_inventario_au;
-
-DELIMITER $$
-
--- ----------------------------- CLIENTE --------------------------------------
--- Conforma o cliente E garante o endereco correspondente na Dim_Endereco.
-CREATE TRIGGER trg_trf_cliente_ai
-AFTER INSERT ON stg_cliente
-FOR EACH ROW
+-- ---- 2.7) Snapshot de inventario de patio -----------------------------------
+DROP PROCEDURE IF EXISTS staging.sp_valviessejoao_transforma_snapshot_patio;
+DELIMITER //
+CREATE PROCEDURE staging.sp_valviessejoao_transforma_snapshot_patio()
 BEGIN
-    INSERT IGNORE INTO trf_dim_endereco (cidade, estado, pais)
-    VALUES (COALESCE(fn_txt_norm(NEW.cidade), 'NAO INFORMADO'),
-            COALESCE(fn_txt_norm(NEW.estado), 'NI'), 'BRASIL');
+    DELETE FROM staging.stg_conf_snapshot_patio WHERE nk_frota_origem = 'valviessejoao';
 
-    INSERT INTO trf_dim_cliente
-        (nk_frota_origem, nk_id_cliente, tipo_cliente, nome, cidade, estado, pais)
-    VALUES (fn_frota_origem(), NEW.id_cliente, fn_txt_norm(NEW.tipo_cliente),
-            TRIM(NEW.nome_razao_social),
-            COALESCE(fn_txt_norm(NEW.cidade), 'NAO INFORMADO'),
-            COALESCE(fn_txt_norm(NEW.estado), 'NI'), 'BRASIL')
-    ON DUPLICATE KEY UPDATE
-        tipo_cliente = VALUES(tipo_cliente), nome = VALUES(nome),
-        cidade = VALUES(cidade), estado = VALUES(estado), pais = VALUES(pais);
-END$$
+    -- DQ: snapshot exige patio + veiculo + grupo + data (todos compoem a PK e FKs)
+    INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+    SELECT 'stg_valviessejoao_inventario_patio', 'valviessejoao', i.id_veiculo, 'Snapshot sem chaves válidas (patio/veiculo/grupo/data)'
+    FROM staging.stg_valviessejoao_inventario_patio i
+    WHERE i.id_patio IS NULL OR i.id_veiculo IS NULL OR i.id_grupo IS NULL OR i.data_snapshot IS NULL;
 
-CREATE TRIGGER trg_trf_cliente_au
-AFTER UPDATE ON stg_cliente
-FOR EACH ROW
+    INSERT INTO staging.stg_conf_snapshot_patio (nk_frota_origem, nk_id_patio, nk_id_veiculo, nk_id_grupo, data_snapshot)
+    SELECT 'valviessejoao', i.id_patio, i.id_veiculo, i.id_grupo, i.data_snapshot
+    FROM staging.stg_valviessejoao_inventario_patio i
+    WHERE i.id_patio IS NOT NULL AND i.id_veiculo IS NOT NULL AND i.id_grupo IS NOT NULL AND i.data_snapshot IS NOT NULL;
+END//
+DELIMITER ;
+
+-- ---- 2.8) Orquestrador ------------------------------------------------------
+DROP PROCEDURE IF EXISTS staging.sp_valviessejoao_transformacao_completa;
+DELIMITER //
+CREATE PROCEDURE staging.sp_valviessejoao_transformacao_completa()
 BEGIN
-    INSERT IGNORE INTO trf_dim_endereco (cidade, estado, pais)
-    VALUES (COALESCE(fn_txt_norm(NEW.cidade), 'NAO INFORMADO'),
-            COALESCE(fn_txt_norm(NEW.estado), 'NI'), 'BRASIL');
+    CALL staging.sp_valviessejoao_transforma_patio();
+    CALL staging.sp_valviessejoao_transforma_grupo();
+    CALL staging.sp_valviessejoao_transforma_veiculo();
+    CALL staging.sp_valviessejoao_transforma_cliente();
+    CALL staging.sp_valviessejoao_transforma_reserva();
+    CALL staging.sp_valviessejoao_transforma_locacao();
+    CALL staging.sp_valviessejoao_transforma_snapshot_patio();
+END//
+DELIMITER ;
 
-    INSERT INTO trf_dim_cliente
-        (nk_frota_origem, nk_id_cliente, tipo_cliente, nome, cidade, estado, pais)
-    VALUES (fn_frota_origem(), NEW.id_cliente, fn_txt_norm(NEW.tipo_cliente),
-            TRIM(NEW.nome_razao_social),
-            COALESCE(fn_txt_norm(NEW.cidade), 'NAO INFORMADO'),
-            COALESCE(fn_txt_norm(NEW.estado), 'NI'), 'BRASIL')
-    ON DUPLICATE KEY UPDATE
-        tipo_cliente = VALUES(tipo_cliente), nome = VALUES(nome),
-        cidade = VALUES(cidade), estado = VALUES(estado), pais = VALUES(pais);
-END$$
+-- ============================================================================
+-- 3) VIEW DE MONITORAMENTO DE QUALIDADE (rejeitos desta frota)
+-- ============================================================================
+CREATE OR REPLACE VIEW staging.vw_valviessejoao_qualidade_etl AS
+SELECT
+    tabela_origem,
+    COUNT(*)        AS total_rejeitos,
+    MIN(dt_rejeito) AS primeiro_rejeito,
+    MAX(dt_rejeito) AS ultimo_rejeito,
+    GROUP_CONCAT(DISTINCT motivo_rejeito ORDER BY motivo_rejeito SEPARATOR ' | ') AS motivos_distintos
+FROM staging.stg_rejeitos_etl
+WHERE nk_frota_origem = 'valviessejoao'
+GROUP BY tabela_origem
+ORDER BY total_rejeitos DESC;
 
--- ----------------------------- VEICULO --------------------------------------
-CREATE TRIGGER trg_trf_veiculo_ai
-AFTER INSERT ON stg_veiculo
-FOR EACH ROW
-INSERT INTO trf_dim_veiculo
-    (nk_frota_origem, nk_id_veiculo, placa, marca, modelo,
-     mecanizacao, tem_ar_condicionado)
-VALUES (fn_frota_origem(), NEW.id_veiculo, fn_txt_norm(NEW.placa),
-        TRIM(NEW.marca), TRIM(NEW.modelo), fn_txt_norm(NEW.mecanizacao),
-        NEW.ar_condicionado)
-ON DUPLICATE KEY UPDATE
-    placa = VALUES(placa), marca = VALUES(marca), modelo = VALUES(modelo),
-    mecanizacao = VALUES(mecanizacao),
-    tem_ar_condicionado = VALUES(tem_ar_condicionado)$$
-
-CREATE TRIGGER trg_trf_veiculo_au
-AFTER UPDATE ON stg_veiculo
-FOR EACH ROW
-INSERT INTO trf_dim_veiculo
-    (nk_frota_origem, nk_id_veiculo, placa, marca, modelo,
-     mecanizacao, tem_ar_condicionado)
-VALUES (fn_frota_origem(), NEW.id_veiculo, fn_txt_norm(NEW.placa),
-        TRIM(NEW.marca), TRIM(NEW.modelo), fn_txt_norm(NEW.mecanizacao),
-        NEW.ar_condicionado)
-ON DUPLICATE KEY UPDATE
-    placa = VALUES(placa), marca = VALUES(marca), modelo = VALUES(modelo),
-    mecanizacao = VALUES(mecanizacao),
-    tem_ar_condicionado = VALUES(tem_ar_condicionado)$$
-
--- ----------------------------- GRUPO ----------------------------------------
-CREATE TRIGGER trg_trf_grupo_ai
-AFTER INSERT ON stg_grupo
-FOR EACH ROW
-INSERT INTO trf_dim_grupo (nk_frota_origem, nk_id_grupo, nome_grupo, valor_diaria)
-VALUES (fn_frota_origem(), NEW.id_grupo, TRIM(NEW.nome_grupo), NEW.faixa_valor_diaria)
-ON DUPLICATE KEY UPDATE
-    nome_grupo = VALUES(nome_grupo), valor_diaria = VALUES(valor_diaria)$$
-
-CREATE TRIGGER trg_trf_grupo_au
-AFTER UPDATE ON stg_grupo
-FOR EACH ROW
-INSERT INTO trf_dim_grupo (nk_frota_origem, nk_id_grupo, nome_grupo, valor_diaria)
-VALUES (fn_frota_origem(), NEW.id_grupo, TRIM(NEW.nome_grupo), NEW.faixa_valor_diaria)
-ON DUPLICATE KEY UPDATE
-    nome_grupo = VALUES(nome_grupo), valor_diaria = VALUES(valor_diaria)$$
+-- ============================================================================
+-- 4) TRIGGERS DE TRANSFORMACAO INCREMENTAL (CDC sobre o staging cru)
+--    Conformam linha a linha cada INSERT/UPDATE feito pela extracao (01) nas
+--    tabelas staging.stg_valviessejoao_*. Mesma logica das procedures, em UPSERT.
+-- ============================================================================
+DELIMITER //
 
 -- ----------------------------- PATIO ----------------------------------------
-CREATE TRIGGER trg_trf_patio_ai
-AFTER INSERT ON stg_patio
-FOR EACH ROW
-INSERT INTO trf_dim_patio (nk_frota_origem, nk_id_patio, nome_patio, capacidade_vagas)
-VALUES (fn_frota_origem(), NEW.id_patio, TRIM(NEW.nome_patio), NULL)
-ON DUPLICATE KEY UPDATE
-    nome_patio = VALUES(nome_patio), capacidade_vagas = VALUES(capacidade_vagas)$$
+DROP TRIGGER IF EXISTS staging.trg_trf_valviessejoao_patio_ai//
+CREATE TRIGGER staging.trg_trf_valviessejoao_patio_ai
+AFTER INSERT ON staging.stg_valviessejoao_patio FOR EACH ROW
+BEGIN
+    INSERT INTO staging.stg_conf_patio
+        (nk_frota_origem, nk_id_patio, nome_patio, capacidade_vagas, end_cidade, end_uf, end_pais)
+    VALUES ('valviessejoao', NEW.id_patio,
+        CONCAT(UPPER(LEFT(TRIM(COALESCE(NEW.nome_patio, CONCAT('PATIO ', NEW.id_patio))), 1)),
+               LOWER(SUBSTRING(TRIM(COALESCE(NEW.nome_patio, CONCAT('PATIO ', NEW.id_patio))), 2))),
+        -1, 'NÃO INFORMADO', 'XX', 'Brasil')
+    ON DUPLICATE KEY UPDATE
+        nome_patio = VALUES(nome_patio), capacidade_vagas = VALUES(capacidade_vagas),
+        end_cidade = VALUES(end_cidade), end_uf = VALUES(end_uf), end_pais = VALUES(end_pais);
+END//
 
-CREATE TRIGGER trg_trf_patio_au
-AFTER UPDATE ON stg_patio
-FOR EACH ROW
-INSERT INTO trf_dim_patio (nk_frota_origem, nk_id_patio, nome_patio, capacidade_vagas)
-VALUES (fn_frota_origem(), NEW.id_patio, TRIM(NEW.nome_patio), NULL)
-ON DUPLICATE KEY UPDATE
-    nome_patio = VALUES(nome_patio), capacidade_vagas = VALUES(capacidade_vagas)$$
+DROP TRIGGER IF EXISTS staging.trg_trf_valviessejoao_patio_au//
+CREATE TRIGGER staging.trg_trf_valviessejoao_patio_au
+AFTER UPDATE ON staging.stg_valviessejoao_patio FOR EACH ROW
+BEGIN
+    INSERT INTO staging.stg_conf_patio
+        (nk_frota_origem, nk_id_patio, nome_patio, capacidade_vagas, end_cidade, end_uf, end_pais)
+    VALUES ('valviessejoao', NEW.id_patio,
+        CONCAT(UPPER(LEFT(TRIM(COALESCE(NEW.nome_patio, CONCAT('PATIO ', NEW.id_patio))), 1)),
+               LOWER(SUBSTRING(TRIM(COALESCE(NEW.nome_patio, CONCAT('PATIO ', NEW.id_patio))), 2))),
+        -1, 'NÃO INFORMADO', 'XX', 'Brasil')
+    ON DUPLICATE KEY UPDATE
+        nome_patio = VALUES(nome_patio), capacidade_vagas = VALUES(capacidade_vagas),
+        end_cidade = VALUES(end_cidade), end_uf = VALUES(end_uf), end_pais = VALUES(end_pais);
+END//
+
+-- ----------------------------- GRUPO ----------------------------------------
+DROP TRIGGER IF EXISTS staging.trg_trf_valviessejoao_grupo_ai//
+CREATE TRIGGER staging.trg_trf_valviessejoao_grupo_ai
+AFTER INSERT ON staging.stg_valviessejoao_grupo FOR EACH ROW
+BEGIN
+    IF NEW.faixa_valor_diaria IS NULL OR NEW.faixa_valor_diaria = 0 THEN
+        INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+        VALUES ('stg_valviessejoao_grupo', 'valviessejoao', NEW.id_grupo, 'Grupo sem valor_diaria vigente; será carregado com valor 0,00');
+    END IF;
+
+    INSERT INTO staging.stg_conf_grupo (nk_frota_origem, nk_id_grupo, nome_grupo, valor_diaria)
+    VALUES ('valviessejoao', NEW.id_grupo,
+        CONCAT(UPPER(LEFT(TRIM(COALESCE(NEW.nome_grupo, CONCAT('GRUPO ', NEW.id_grupo))), 1)),
+               LOWER(SUBSTRING(TRIM(COALESCE(NEW.nome_grupo, CONCAT('GRUPO ', NEW.id_grupo))), 2))),
+        COALESCE(NEW.faixa_valor_diaria, 0))
+    ON DUPLICATE KEY UPDATE nome_grupo = VALUES(nome_grupo), valor_diaria = VALUES(valor_diaria);
+END//
+
+DROP TRIGGER IF EXISTS staging.trg_trf_valviessejoao_grupo_au//
+CREATE TRIGGER staging.trg_trf_valviessejoao_grupo_au
+AFTER UPDATE ON staging.stg_valviessejoao_grupo FOR EACH ROW
+BEGIN
+    INSERT INTO staging.stg_conf_grupo (nk_frota_origem, nk_id_grupo, nome_grupo, valor_diaria)
+    VALUES ('valviessejoao', NEW.id_grupo,
+        CONCAT(UPPER(LEFT(TRIM(COALESCE(NEW.nome_grupo, CONCAT('GRUPO ', NEW.id_grupo))), 1)),
+               LOWER(SUBSTRING(TRIM(COALESCE(NEW.nome_grupo, CONCAT('GRUPO ', NEW.id_grupo))), 2))),
+        COALESCE(NEW.faixa_valor_diaria, 0))
+    ON DUPLICATE KEY UPDATE nome_grupo = VALUES(nome_grupo), valor_diaria = VALUES(valor_diaria);
+END//
+
+-- ----------------------------- VEICULO --------------------------------------
+DROP TRIGGER IF EXISTS staging.trg_trf_valviessejoao_veiculo_ai//
+CREATE TRIGGER staging.trg_trf_valviessejoao_veiculo_ai
+AFTER INSERT ON staging.stg_valviessejoao_veiculo FOR EACH ROW
+BEGIN
+    IF NEW.id_grupo IS NULL THEN
+        INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+        VALUES ('stg_valviessejoao_veiculo', 'valviessejoao', NEW.id_veiculo, 'Veículo sem id_grupo');
+    ELSE
+        INSERT INTO staging.stg_conf_veiculo
+            (nk_frota_origem, nk_id_veiculo, nk_id_grupo, nk_id_patio_origem,
+             placa, marca, modelo, mecanizacao, tem_ar_condicionado)
+        VALUES ('valviessejoao', NEW.id_veiculo, NEW.id_grupo, NEW.id_patio_atual,
+            COALESCE(NULLIF(UPPER(TRIM(NEW.placa)), ''), 'SEM PLACA'),
+            CONCAT(UPPER(LEFT(TRIM(COALESCE(NEW.marca, 'NÃO INFORMADO')), 1)),
+                   LOWER(SUBSTRING(TRIM(COALESCE(NEW.marca, 'NÃO INFORMADO')), 2))),
+            CONCAT(UPPER(LEFT(TRIM(COALESCE(NEW.modelo, 'NÃO INFORMADO')), 1)),
+                   LOWER(SUBSTRING(TRIM(COALESCE(NEW.modelo, 'NÃO INFORMADO')), 2))),
+            CASE
+                WHEN UPPER(TRIM(COALESCE(NEW.mecanizacao, ''))) IN ('MANUAL') THEN 'MANUAL'
+                WHEN UPPER(TRIM(COALESCE(NEW.mecanizacao, ''))) IN ('AUTOMATICO', 'AUTOMÁTICO', 'AUTOMATICA', 'AUTOMÁTICA') THEN 'AUTOMATICO'
+                ELSE 'NÃO INFORMADO'
+            END,
+            COALESCE(NEW.ar_condicionado, FALSE))
+        ON DUPLICATE KEY UPDATE
+            nk_id_grupo = VALUES(nk_id_grupo), nk_id_patio_origem = VALUES(nk_id_patio_origem),
+            placa = VALUES(placa), marca = VALUES(marca), modelo = VALUES(modelo),
+            mecanizacao = VALUES(mecanizacao), tem_ar_condicionado = VALUES(tem_ar_condicionado);
+    END IF;
+END//
+
+DROP TRIGGER IF EXISTS staging.trg_trf_valviessejoao_veiculo_au//
+CREATE TRIGGER staging.trg_trf_valviessejoao_veiculo_au
+AFTER UPDATE ON staging.stg_valviessejoao_veiculo FOR EACH ROW
+BEGIN
+    IF NEW.id_grupo IS NOT NULL THEN
+        INSERT INTO staging.stg_conf_veiculo
+            (nk_frota_origem, nk_id_veiculo, nk_id_grupo, nk_id_patio_origem,
+             placa, marca, modelo, mecanizacao, tem_ar_condicionado)
+        VALUES ('valviessejoao', NEW.id_veiculo, NEW.id_grupo, NEW.id_patio_atual,
+            COALESCE(NULLIF(UPPER(TRIM(NEW.placa)), ''), 'SEM PLACA'),
+            CONCAT(UPPER(LEFT(TRIM(COALESCE(NEW.marca, 'NÃO INFORMADO')), 1)),
+                   LOWER(SUBSTRING(TRIM(COALESCE(NEW.marca, 'NÃO INFORMADO')), 2))),
+            CONCAT(UPPER(LEFT(TRIM(COALESCE(NEW.modelo, 'NÃO INFORMADO')), 1)),
+                   LOWER(SUBSTRING(TRIM(COALESCE(NEW.modelo, 'NÃO INFORMADO')), 2))),
+            CASE
+                WHEN UPPER(TRIM(COALESCE(NEW.mecanizacao, ''))) IN ('MANUAL') THEN 'MANUAL'
+                WHEN UPPER(TRIM(COALESCE(NEW.mecanizacao, ''))) IN ('AUTOMATICO', 'AUTOMÁTICO', 'AUTOMATICA', 'AUTOMÁTICA') THEN 'AUTOMATICO'
+                ELSE 'NÃO INFORMADO'
+            END,
+            COALESCE(NEW.ar_condicionado, FALSE))
+        ON DUPLICATE KEY UPDATE
+            nk_id_grupo = VALUES(nk_id_grupo), nk_id_patio_origem = VALUES(nk_id_patio_origem),
+            placa = VALUES(placa), marca = VALUES(marca), modelo = VALUES(modelo),
+            mecanizacao = VALUES(mecanizacao), tem_ar_condicionado = VALUES(tem_ar_condicionado);
+    END IF;
+END//
+
+-- ----------------------------- CLIENTE --------------------------------------
+DROP TRIGGER IF EXISTS staging.trg_trf_valviessejoao_cliente_ai//
+CREATE TRIGGER staging.trg_trf_valviessejoao_cliente_ai
+AFTER INSERT ON staging.stg_valviessejoao_cliente FOR EACH ROW
+BEGIN
+    IF UPPER(TRIM(COALESCE(NEW.tipo_cliente, ''))) NOT IN ('PF', 'PJ') THEN
+        INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+        VALUES ('stg_valviessejoao_cliente', 'valviessejoao', NEW.id_cliente, 'Cliente sem tipo_cliente válido (PF/PJ)');
+    ELSE
+        INSERT INTO staging.stg_conf_cliente
+            (nk_frota_origem, nk_id_cliente, tipo_cliente, nome, end_cidade, end_uf, end_pais)
+        VALUES ('valviessejoao', NEW.id_cliente, UPPER(TRIM(NEW.tipo_cliente)),
+            CONCAT(UPPER(LEFT(TRIM(COALESCE(NEW.nome_razao_social, 'NÃO IDENTIFICADO')), 1)),
+                   LOWER(SUBSTRING(TRIM(COALESCE(NEW.nome_razao_social, 'NÃO IDENTIFICADO')), 2))),
+            COALESCE(NULLIF(TRIM(NEW.cidade), ''), 'NÃO INFORMADO'),
+            COALESCE(NULLIF(TRIM(NEW.estado), ''), 'XX'), 'Brasil')
+        ON DUPLICATE KEY UPDATE
+            tipo_cliente = VALUES(tipo_cliente), nome = VALUES(nome),
+            end_cidade = VALUES(end_cidade), end_uf = VALUES(end_uf), end_pais = VALUES(end_pais);
+    END IF;
+END//
+
+DROP TRIGGER IF EXISTS staging.trg_trf_valviessejoao_cliente_au//
+CREATE TRIGGER staging.trg_trf_valviessejoao_cliente_au
+AFTER UPDATE ON staging.stg_valviessejoao_cliente FOR EACH ROW
+BEGIN
+    IF UPPER(TRIM(COALESCE(NEW.tipo_cliente, ''))) IN ('PF', 'PJ') THEN
+        INSERT INTO staging.stg_conf_cliente
+            (nk_frota_origem, nk_id_cliente, tipo_cliente, nome, end_cidade, end_uf, end_pais)
+        VALUES ('valviessejoao', NEW.id_cliente, UPPER(TRIM(NEW.tipo_cliente)),
+            CONCAT(UPPER(LEFT(TRIM(COALESCE(NEW.nome_razao_social, 'NÃO IDENTIFICADO')), 1)),
+                   LOWER(SUBSTRING(TRIM(COALESCE(NEW.nome_razao_social, 'NÃO IDENTIFICADO')), 2))),
+            COALESCE(NULLIF(TRIM(NEW.cidade), ''), 'NÃO INFORMADO'),
+            COALESCE(NULLIF(TRIM(NEW.estado), ''), 'XX'), 'Brasil')
+        ON DUPLICATE KEY UPDATE
+            tipo_cliente = VALUES(tipo_cliente), nome = VALUES(nome),
+            end_cidade = VALUES(end_cidade), end_uf = VALUES(end_uf), end_pais = VALUES(end_pais);
+    END IF;
+END//
 
 -- ----------------------------- RESERVA --------------------------------------
--- Calcula duracao e valor previsto (busca a diaria do grupo no staging).
-CREATE TRIGGER trg_trf_reserva_ai
-AFTER INSERT ON stg_reserva
-FOR EACH ROW
+DROP TRIGGER IF EXISTS staging.trg_trf_valviessejoao_reserva_ai//
+CREATE TRIGGER staging.trg_trf_valviessejoao_reserva_ai
+AFTER INSERT ON staging.stg_valviessejoao_reserva FOR EACH ROW
 BEGIN
-IF NEW.id_cliente IS NULL OR NEW.id_grupo IS NULL OR NEW.id_patio_retirada IS NULL OR NEW.id_patio_devolucao_previsto IS NULL OR NEW.data_reserva IS NULL OR NEW.data_prev_retirada IS NULL OR NEW.data_prev_devolucao IS NULL OR NEW.data_prev_devolucao <= NEW.data_prev_retirada THEN
-    INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
-    VALUES ('stg_reserva', fn_frota_origem(), NEW.id_reserva,
-        CASE
-            WHEN NEW.id_cliente IS NULL            THEN 'Reserva sem cliente'
-            WHEN NEW.id_grupo IS NULL              THEN 'Reserva sem grupo'
-            WHEN NEW.id_patio_retirada IS NULL     THEN 'Reserva sem pátio de retirada'
-            WHEN NEW.id_patio_devolucao_previsto IS NULL THEN 'Reserva sem pátio de fim'
-            WHEN NEW.data_reserva IS NULL             THEN 'Reserva sem data de reserva'
-            WHEN NEW.data_prev_retirada IS NULL   THEN 'Reserva sem data de retirada prevista'
-            WHEN NEW.data_prev_devolucao IS NULL  THEN 'Reserva sem data de devolução prevista'
-            WHEN NEW.data_prev_devolucao <= NEW.data_prev_retirada THEN 'Data devolução <= data retirada'
-            ELSE 'Erro desconhecido'
-        END,
-        JSON_OBJECT('nk_id_reserva', NEW.id_reserva, 'nk_id_cliente', NEW.id_cliente, 'nk_id_grupo', NEW.id_grupo, 'nk_id_patio_retirada', NEW.id_patio_retirada, 'nk_id_patio_fim', NEW.id_patio_devolucao_previsto, 'data_reserva', NEW.data_reserva, 'data_retirada_prevista', NEW.data_prev_retirada, 'data_devolucao_prevista', NEW.data_prev_devolucao)
-    );
-ELSE
-    INSERT INTO trf_fato_reserva
-        (nk_frota_origem, nk_id_reserva, dt_reserva, dt_prev_retirada,
-         dt_prev_devolucao, nk_id_cliente, nk_id_grupo, nk_id_patio_retirada,
-     nk_id_patio_fim, duracao_prevista_dias, valor_previsto_reserva,
-     dd_status_reserva, qtde_reservas)
-VALUES (fn_frota_origem(), NEW.id_reserva, NEW.data_reserva, NEW.data_prev_retirada,
-        NEW.data_prev_devolucao, NEW.id_cliente, NEW.id_grupo, NEW.id_patio_retirada,
-        NEW.id_patio_devolucao_previsto,
-        DATEDIFF(NEW.data_prev_devolucao, NEW.data_prev_retirada),
-        DATEDIFF(NEW.data_prev_devolucao, NEW.data_prev_retirada)
-            * COALESCE((SELECT g.faixa_valor_diaria FROM stg_grupo g
-                        WHERE g.id_grupo = NEW.id_grupo), 0),
-        fn_txt_norm(NEW.status_reserva), 1)
-ON DUPLICATE KEY UPDATE
-    dt_reserva = VALUES(dt_reserva), dt_prev_retirada = VALUES(dt_prev_retirada),
-    dt_prev_devolucao = VALUES(dt_prev_devolucao), nk_id_cliente = VALUES(nk_id_cliente),
-    nk_id_grupo = VALUES(nk_id_grupo), nk_id_patio_retirada = VALUES(nk_id_patio_retirada),
-    nk_id_patio_fim = VALUES(nk_id_patio_fim),
-    duracao_prevista_dias = VALUES(duracao_prevista_dias),
-    valor_previsto_reserva = VALUES(valor_previsto_reserva),
-    dd_status_reserva = VALUES(dd_status_reserva);
-END IF;
-END$$
+    IF NEW.id_cliente IS NULL OR NEW.id_grupo IS NULL OR NEW.id_patio_retirada IS NULL
+       OR NEW.id_patio_devolucao_previsto IS NULL OR NEW.data_reserva IS NULL
+       OR NEW.data_prev_retirada IS NULL OR NEW.data_prev_devolucao IS NULL
+       OR NEW.data_prev_devolucao <= NEW.data_prev_retirada THEN
+        INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+        VALUES ('stg_valviessejoao_reserva', 'valviessejoao', NEW.id_reserva,
+            CASE
+                WHEN NEW.id_cliente IS NULL THEN 'Reserva sem cliente'
+                WHEN NEW.id_grupo IS NULL THEN 'Reserva sem grupo'
+                WHEN NEW.id_patio_retirada IS NULL THEN 'Reserva sem pátio de retirada'
+                WHEN NEW.id_patio_devolucao_previsto IS NULL THEN 'Reserva sem pátio de fim'
+                WHEN NEW.data_reserva IS NULL THEN 'Reserva sem data de reserva'
+                WHEN NEW.data_prev_retirada IS NULL THEN 'Reserva sem data de retirada prevista'
+                WHEN NEW.data_prev_devolucao IS NULL THEN 'Reserva sem data de devolução prevista'
+                WHEN NEW.data_prev_devolucao <= NEW.data_prev_retirada THEN 'Data devolução <= data retirada (duração < 1)'
+                ELSE 'Erro desconhecido'
+            END);
+    ELSE
+        INSERT INTO staging.stg_conf_reserva
+            (nk_frota_origem, nk_id_reserva, nk_id_cliente, nk_id_grupo, nk_id_patio_retirada, nk_id_patio_fim,
+             data_reserva, data_retirada_prevista, data_devolucao_prevista,
+             duracao_prevista_dias, valor_previsto_reserva, status_reserva)
+        VALUES ('valviessejoao', NEW.id_reserva, NEW.id_cliente, NEW.id_grupo, NEW.id_patio_retirada, NEW.id_patio_devolucao_previsto,
+            NEW.data_reserva, NEW.data_prev_retirada, NEW.data_prev_devolucao,
+            DATEDIFF(NEW.data_prev_devolucao, NEW.data_prev_retirada),
+            DATEDIFF(NEW.data_prev_devolucao, NEW.data_prev_retirada)
+                * COALESCE((SELECT g.faixa_valor_diaria FROM staging.stg_valviessejoao_grupo g WHERE g.id_grupo = NEW.id_grupo), 0),
+            CASE UPPER(TRIM(COALESCE(NEW.status_reserva, '')))
+                WHEN 'ATIVA' THEN 'ATIVA' WHEN 'CANCELADA' THEN 'CANCELADA' WHEN 'CONVERTIDA' THEN 'CONVERTIDA' ELSE 'ATIVA'
+            END)
+        ON DUPLICATE KEY UPDATE
+            nk_id_cliente = VALUES(nk_id_cliente), nk_id_grupo = VALUES(nk_id_grupo),
+            nk_id_patio_retirada = VALUES(nk_id_patio_retirada), nk_id_patio_fim = VALUES(nk_id_patio_fim),
+            data_reserva = VALUES(data_reserva), data_retirada_prevista = VALUES(data_retirada_prevista),
+            data_devolucao_prevista = VALUES(data_devolucao_prevista),
+            duracao_prevista_dias = VALUES(duracao_prevista_dias),
+            valor_previsto_reserva = VALUES(valor_previsto_reserva), status_reserva = VALUES(status_reserva);
+    END IF;
+END//
 
-CREATE TRIGGER trg_trf_reserva_au
-AFTER UPDATE ON stg_reserva
-FOR EACH ROW
+DROP TRIGGER IF EXISTS staging.trg_trf_valviessejoao_reserva_au//
+CREATE TRIGGER staging.trg_trf_valviessejoao_reserva_au
+AFTER UPDATE ON staging.stg_valviessejoao_reserva FOR EACH ROW
 BEGIN
-IF NEW.id_cliente IS NOT NULL AND NEW.id_grupo IS NOT NULL AND NEW.id_patio_retirada IS NOT NULL AND NEW.id_patio_devolucao_previsto IS NOT NULL AND NEW.data_reserva IS NOT NULL AND NEW.data_prev_retirada IS NOT NULL AND NEW.data_prev_devolucao IS NOT NULL AND NEW.data_prev_devolucao > NEW.data_prev_retirada THEN
-    INSERT INTO trf_fato_reserva
-        (nk_frota_origem, nk_id_reserva, dt_reserva, dt_prev_retirada,
-         dt_prev_devolucao, nk_id_cliente, nk_id_grupo, nk_id_patio_retirada,
-     nk_id_patio_fim, duracao_prevista_dias, valor_previsto_reserva,
-     dd_status_reserva, qtde_reservas)
-VALUES (fn_frota_origem(), NEW.id_reserva, NEW.data_reserva, NEW.data_prev_retirada,
-        NEW.data_prev_devolucao, NEW.id_cliente, NEW.id_grupo, NEW.id_patio_retirada,
-        NEW.id_patio_devolucao_previsto,
-        DATEDIFF(NEW.data_prev_devolucao, NEW.data_prev_retirada),
-        DATEDIFF(NEW.data_prev_devolucao, NEW.data_prev_retirada)
-            * COALESCE((SELECT g.faixa_valor_diaria FROM stg_grupo g
-                        WHERE g.id_grupo = NEW.id_grupo), 0),
-        fn_txt_norm(NEW.status_reserva), 1)
-ON DUPLICATE KEY UPDATE
-    dt_reserva = VALUES(dt_reserva), dt_prev_retirada = VALUES(dt_prev_retirada),
-    dt_prev_devolucao = VALUES(dt_prev_devolucao), nk_id_cliente = VALUES(nk_id_cliente),
-    nk_id_grupo = VALUES(nk_id_grupo), nk_id_patio_retirada = VALUES(nk_id_patio_retirada),
-    nk_id_patio_fim = VALUES(nk_id_patio_fim),
-    duracao_prevista_dias = VALUES(duracao_prevista_dias),
-    valor_previsto_reserva = VALUES(valor_previsto_reserva),
-    dd_status_reserva = VALUES(dd_status_reserva);
-END IF;
-END$$
+    IF NEW.id_cliente IS NOT NULL AND NEW.id_grupo IS NOT NULL AND NEW.id_patio_retirada IS NOT NULL
+       AND NEW.id_patio_devolucao_previsto IS NOT NULL AND NEW.data_reserva IS NOT NULL
+       AND NEW.data_prev_retirada IS NOT NULL AND NEW.data_prev_devolucao IS NOT NULL
+       AND NEW.data_prev_devolucao > NEW.data_prev_retirada THEN
+        INSERT INTO staging.stg_conf_reserva
+            (nk_frota_origem, nk_id_reserva, nk_id_cliente, nk_id_grupo, nk_id_patio_retirada, nk_id_patio_fim,
+             data_reserva, data_retirada_prevista, data_devolucao_prevista,
+             duracao_prevista_dias, valor_previsto_reserva, status_reserva)
+        VALUES ('valviessejoao', NEW.id_reserva, NEW.id_cliente, NEW.id_grupo, NEW.id_patio_retirada, NEW.id_patio_devolucao_previsto,
+            NEW.data_reserva, NEW.data_prev_retirada, NEW.data_prev_devolucao,
+            DATEDIFF(NEW.data_prev_devolucao, NEW.data_prev_retirada),
+            DATEDIFF(NEW.data_prev_devolucao, NEW.data_prev_retirada)
+                * COALESCE((SELECT g.faixa_valor_diaria FROM staging.stg_valviessejoao_grupo g WHERE g.id_grupo = NEW.id_grupo), 0),
+            CASE UPPER(TRIM(COALESCE(NEW.status_reserva, '')))
+                WHEN 'ATIVA' THEN 'ATIVA' WHEN 'CANCELADA' THEN 'CANCELADA' WHEN 'CONVERTIDA' THEN 'CONVERTIDA' ELSE 'ATIVA'
+            END)
+        ON DUPLICATE KEY UPDATE
+            nk_id_cliente = VALUES(nk_id_cliente), nk_id_grupo = VALUES(nk_id_grupo),
+            nk_id_patio_retirada = VALUES(nk_id_patio_retirada), nk_id_patio_fim = VALUES(nk_id_patio_fim),
+            data_reserva = VALUES(data_reserva), data_retirada_prevista = VALUES(data_retirada_prevista),
+            data_devolucao_prevista = VALUES(data_devolucao_prevista),
+            duracao_prevista_dias = VALUES(duracao_prevista_dias),
+            valor_previsto_reserva = VALUES(valor_previsto_reserva), status_reserva = VALUES(status_reserva);
+    END IF;
+END//
 
 -- ----------------------------- LOCACAO --------------------------------------
--- INSERT  = nova locacao; UPDATE = devolucao (preenche datas/patio/valor reais).
-CREATE TRIGGER trg_trf_locacao_ai
-AFTER INSERT ON stg_locacao
-FOR EACH ROW
+DROP TRIGGER IF EXISTS staging.trg_trf_valviessejoao_locacao_ai//
+CREATE TRIGGER staging.trg_trf_valviessejoao_locacao_ai
+AFTER INSERT ON staging.stg_valviessejoao_locacao FOR EACH ROW
 BEGIN
-IF NEW.id_cliente IS NULL OR NEW.id_veiculo IS NULL OR NEW.id_grupo IS NULL OR NEW.id_patio_retirada IS NULL OR NEW.data_hora_retirada IS NULL OR NEW.data_hora_prev_devolucao IS NULL OR (NEW.data_hora_real_devolucao IS NOT NULL AND DATE(NEW.data_hora_real_devolucao) < DATE(NEW.data_hora_retirada)) THEN
-    INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito, dados_json)
-    VALUES ('stg_locacao', fn_frota_origem(), NEW.id_locacao,
-        CASE
-            WHEN NEW.id_cliente IS NULL         THEN 'Locação sem cliente'
-            WHEN NEW.id_veiculo IS NULL         THEN 'Locação sem veículo'
-            WHEN NEW.id_grupo IS NULL           THEN 'Locação sem grupo'
-            WHEN NEW.id_patio_retirada IS NULL  THEN 'Locação sem pátio de retirada'
-            WHEN NEW.data_hora_retirada IS NULL THEN 'Locação sem data de retirada'
-            WHEN NEW.data_hora_prev_devolucao IS NULL THEN 'Locação sem data prev. devolução'
-            WHEN NEW.data_hora_real_devolucao IS NOT NULL AND DATE(NEW.data_hora_real_devolucao) < DATE(NEW.data_hora_retirada) THEN 'Data devolução real anterior à retirada'
-            ELSE 'Erro desconhecido'
-        END,
-        JSON_OBJECT('nk_id_locacao', NEW.id_locacao, 'nk_id_cliente', NEW.id_cliente, 'nk_id_veiculo', NEW.id_veiculo, 'nk_id_grupo', NEW.id_grupo, 'nk_id_patio_retirada', NEW.id_patio_retirada, 'data_retirada', NEW.data_hora_retirada, 'data_prev_devolucao', NEW.data_hora_prev_devolucao, 'data_real_devolucao', NEW.data_hora_real_devolucao, 'valor_final', NEW.valor_final)
-    );
-ELSE
-    INSERT INTO trf_fato_locacao
-        (nk_frota_origem, nk_id_locacao, dt_retirada, dt_prev_devolucao,
-         dt_real_devolucao, nk_id_cliente, nk_id_veiculo, nk_id_grupo,
-         nk_id_patio_retirada, nk_id_patio_devol_real, valor_final, qtde_locacoes)
-VALUES (fn_frota_origem(), NEW.id_locacao, DATE(NEW.data_hora_retirada),
-        DATE(NEW.data_hora_prev_devolucao), DATE(NEW.data_hora_real_devolucao),
-        NEW.id_cliente, NEW.id_veiculo, NEW.id_grupo, NEW.id_patio_retirada,
-        NEW.id_patio_devolucao_real, NEW.valor_final, 1)
-ON DUPLICATE KEY UPDATE
-    dt_retirada = VALUES(dt_retirada), dt_prev_devolucao = VALUES(dt_prev_devolucao),
-    dt_real_devolucao = VALUES(dt_real_devolucao), nk_id_cliente = VALUES(nk_id_cliente),
-    nk_id_veiculo = VALUES(nk_id_veiculo), nk_id_grupo = VALUES(nk_id_grupo),
-    nk_id_patio_devol_real = VALUES(nk_id_patio_devol_real),
-    valor_final = VALUES(valor_final);
-END IF;
-END$$
+    IF NEW.id_cliente IS NULL OR NEW.id_veiculo IS NULL OR NEW.id_grupo IS NULL OR NEW.id_patio_retirada IS NULL
+       OR NEW.data_hora_retirada IS NULL OR NEW.data_hora_prev_devolucao IS NULL
+       OR (NEW.data_hora_real_devolucao IS NOT NULL AND DATE(NEW.data_hora_real_devolucao) < DATE(NEW.data_hora_retirada)) THEN
+        INSERT INTO staging.stg_rejeitos_etl (tabela_origem, nk_frota_origem, nk_id_registro, motivo_rejeito)
+        VALUES ('stg_valviessejoao_locacao', 'valviessejoao', NEW.id_locacao,
+            CASE
+                WHEN NEW.id_cliente IS NULL THEN 'Locação sem cliente'
+                WHEN NEW.id_veiculo IS NULL THEN 'Locação sem veículo'
+                WHEN NEW.id_grupo IS NULL THEN 'Locação sem grupo'
+                WHEN NEW.id_patio_retirada IS NULL THEN 'Locação sem pátio de retirada'
+                WHEN NEW.data_hora_retirada IS NULL THEN 'Locação sem data de retirada'
+                WHEN NEW.data_hora_prev_devolucao IS NULL THEN 'Locação sem data prev. devolução'
+                ELSE 'Data devolução real anterior à retirada'
+            END);
+    ELSE
+        INSERT INTO staging.stg_conf_locacao
+            (nk_frota_origem, nk_id_locacao, nk_id_cliente, nk_id_veiculo, nk_id_grupo,
+             nk_id_patio_retirada, nk_id_patio_devolucao, data_retirada, data_prev_devolucao,
+             data_real_devolucao, valor_final)
+        VALUES ('valviessejoao', NEW.id_locacao, NEW.id_cliente, NEW.id_veiculo, NEW.id_grupo,
+            NEW.id_patio_retirada, NEW.id_patio_devolucao_real,
+            DATE(NEW.data_hora_retirada), DATE(NEW.data_hora_prev_devolucao), DATE(NEW.data_hora_real_devolucao),
+            GREATEST(COALESCE(NEW.valor_final, 0), 0))
+        ON DUPLICATE KEY UPDATE
+            nk_id_cliente = VALUES(nk_id_cliente), nk_id_veiculo = VALUES(nk_id_veiculo),
+            nk_id_grupo = VALUES(nk_id_grupo), nk_id_patio_retirada = VALUES(nk_id_patio_retirada),
+            nk_id_patio_devolucao = VALUES(nk_id_patio_devolucao), data_retirada = VALUES(data_retirada),
+            data_prev_devolucao = VALUES(data_prev_devolucao), data_real_devolucao = VALUES(data_real_devolucao),
+            valor_final = VALUES(valor_final);
+    END IF;
+END//
 
-CREATE TRIGGER trg_trf_locacao_au
-AFTER UPDATE ON stg_locacao
-FOR EACH ROW
+DROP TRIGGER IF EXISTS staging.trg_trf_valviessejoao_locacao_au//
+CREATE TRIGGER staging.trg_trf_valviessejoao_locacao_au
+AFTER UPDATE ON staging.stg_valviessejoao_locacao FOR EACH ROW
 BEGIN
-IF NEW.id_cliente IS NOT NULL AND NEW.id_veiculo IS NOT NULL AND NEW.id_grupo IS NOT NULL AND NEW.id_patio_retirada IS NOT NULL AND NEW.data_hora_retirada IS NOT NULL AND NEW.data_hora_prev_devolucao IS NOT NULL AND (NEW.data_hora_real_devolucao IS NULL OR DATE(NEW.data_hora_real_devolucao) >= DATE(NEW.data_hora_retirada)) THEN
-    INSERT INTO trf_fato_locacao
-        (nk_frota_origem, nk_id_locacao, dt_retirada, dt_prev_devolucao,
-         dt_real_devolucao, nk_id_cliente, nk_id_veiculo, nk_id_grupo,
-         nk_id_patio_retirada, nk_id_patio_devol_real, valor_final, qtde_locacoes)
-VALUES (fn_frota_origem(), NEW.id_locacao, DATE(NEW.data_hora_retirada),
-        DATE(NEW.data_hora_prev_devolucao), DATE(NEW.data_hora_real_devolucao),
-        NEW.id_cliente, NEW.id_veiculo, NEW.id_grupo, NEW.id_patio_retirada,
-        NEW.id_patio_devolucao_real, NEW.valor_final, 1)
-ON DUPLICATE KEY UPDATE
-    dt_retirada = VALUES(dt_retirada), dt_prev_devolucao = VALUES(dt_prev_devolucao),
-    dt_real_devolucao = VALUES(dt_real_devolucao), nk_id_cliente = VALUES(nk_id_cliente),
-    nk_id_veiculo = VALUES(nk_id_veiculo), nk_id_grupo = VALUES(nk_id_grupo),
-    nk_id_patio_devol_real = VALUES(nk_id_patio_devol_real),
-    valor_final = VALUES(valor_final);
-END IF;
-END$$
-
--- --------------------------- INVENTARIO -------------------------------------
-CREATE TRIGGER trg_trf_inventario_ai
-AFTER INSERT ON stg_inventario_patio
-FOR EACH ROW
-INSERT INTO trf_fato_inventario_patio
-    (nk_frota_origem, dt_referencia, nk_id_patio, nk_id_veiculo,
-     nk_id_grupo, qtde_veiculos_presentes)
-VALUES (fn_frota_origem(), NEW.data_snapshot, NEW.id_patio, NEW.id_veiculo,
-        NEW.id_grupo, 1)
-ON DUPLICATE KEY UPDATE
-    nk_id_patio = VALUES(nk_id_patio), nk_id_grupo = VALUES(nk_id_grupo),
-    qtde_veiculos_presentes = VALUES(qtde_veiculos_presentes)$$
-
-CREATE TRIGGER trg_trf_inventario_au
-AFTER UPDATE ON stg_inventario_patio
-FOR EACH ROW
-INSERT INTO trf_fato_inventario_patio
-    (nk_frota_origem, dt_referencia, nk_id_patio, nk_id_veiculo,
-     nk_id_grupo, qtde_veiculos_presentes)
-VALUES (fn_frota_origem(), NEW.data_snapshot, NEW.id_patio, NEW.id_veiculo,
-        NEW.id_grupo, 1)
-ON DUPLICATE KEY UPDATE
-    nk_id_patio = VALUES(nk_id_patio), nk_id_grupo = VALUES(nk_id_grupo),
-    qtde_veiculos_presentes = VALUES(qtde_veiculos_presentes)$$
+    IF NEW.id_cliente IS NOT NULL AND NEW.id_veiculo IS NOT NULL AND NEW.id_grupo IS NOT NULL
+       AND NEW.id_patio_retirada IS NOT NULL AND NEW.data_hora_retirada IS NOT NULL
+       AND NEW.data_hora_prev_devolucao IS NOT NULL
+       AND (NEW.data_hora_real_devolucao IS NULL OR DATE(NEW.data_hora_real_devolucao) >= DATE(NEW.data_hora_retirada)) THEN
+        INSERT INTO staging.stg_conf_locacao
+            (nk_frota_origem, nk_id_locacao, nk_id_cliente, nk_id_veiculo, nk_id_grupo,
+             nk_id_patio_retirada, nk_id_patio_devolucao, data_retirada, data_prev_devolucao,
+             data_real_devolucao, valor_final)
+        VALUES ('valviessejoao', NEW.id_locacao, NEW.id_cliente, NEW.id_veiculo, NEW.id_grupo,
+            NEW.id_patio_retirada, NEW.id_patio_devolucao_real,
+            DATE(NEW.data_hora_retirada), DATE(NEW.data_hora_prev_devolucao), DATE(NEW.data_hora_real_devolucao),
+            GREATEST(COALESCE(NEW.valor_final, 0), 0))
+        ON DUPLICATE KEY UPDATE
+            nk_id_patio_devolucao = VALUES(nk_id_patio_devolucao), data_real_devolucao = VALUES(data_real_devolucao),
+            valor_final = VALUES(valor_final);
+    END IF;
+END//
 
 DELIMITER ;
 
+-- ============================================================================
+-- 5) TRANSFORMACAO INICIAL EM LOTE (executar uma vez, apos a carga do 01).
+--    Depois disso, os TRIGGERS acima mantem staging.stg_conf_* atualizado.
+-- ============================================================================
+CALL staging.sp_valviessejoao_transformacao_completa();
 
--- 4) TRANSFORMACAO INICIAL EM LOTE (executar uma vez, apos a carga inicial do
---    script 01). Depois disso, os TRIGGERS acima mantem trf_* atualizado.
-CALL sp_transforma_tudo();
-
+-- FIM DO SCRIPT DE TRANSFORMACAO (valviessejoao)
