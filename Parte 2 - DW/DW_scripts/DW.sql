@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS dw.dim_veiculo (
     nk_id_veiculo INT NOT NULL,
     placa VARCHAR(10),
     marca VARCHAR(50),
-    modelo VARCHAR(50),
+    modelo VARCHAR(60),
     mecanizacao VARCHAR(20),
     tem_ar_condicionado BOOLEAN,
     CONSTRAINT pk_dim_veiculo PRIMARY KEY (sk_veiculo),
@@ -92,8 +92,8 @@ CREATE TABLE IF NOT EXISTS dw.dim_grupo (
     sk_grupo INT NOT NULL AUTO_INCREMENT,
     nk_frota_origem VARCHAR(100) NOT NULL,
     nk_id_grupo INT NOT NULL,
-    nome_grupo VARCHAR(50),
-    valor_diaria DECIMAL(10,2),
+    nome_grupo VARCHAR(80),
+    valor_diaria DECIMAL(12,2),
     CONSTRAINT pk_dim_grupo PRIMARY KEY (sk_grupo),
     CONSTRAINT uk_dim_grupo_nk UNIQUE (nk_frota_origem, nk_id_grupo),
     CONSTRAINT ck_dim_grupo_diaria CHECK (valor_diaria >= 0)
@@ -109,8 +109,11 @@ CREATE TABLE IF NOT EXISTS dw.dim_patio (
     nk_id_patio INT NOT NULL,
     nome_patio VARCHAR(100),
     capacidade_vagas_patio INT DEFAULT -1,
+    sk_endereco INT,
     CONSTRAINT pk_dim_patio PRIMARY KEY (sk_patio),
-    CONSTRAINT uk_dim_patio_nk UNIQUE (nk_frota_origem, nk_id_patio)
+    CONSTRAINT uk_dim_patio_nk UNIQUE (nk_frota_origem, nk_id_patio),
+    CONSTRAINT fk_dim_patio_endereco FOREIGN KEY (sk_endereco)
+        REFERENCES dw.dim_endereco (sk_endereco)
 );
 
 -- ----------------------------------------------------------------------------
@@ -187,7 +190,7 @@ CREATE TABLE IF NOT EXISTS dw.fato_locacao (
     sk_grupo INT NOT NULL,
     sk_patio_retirada INT NOT NULL,
     sk_patio_devolucao_real INT,
-    valor_final DECIMAL(10,2) DEFAULT 0.00,
+    valor_final DECIMAL(14,2) DEFAULT 0.00,
     qtde_locacoes INT DEFAULT 1 NOT NULL,
     CONSTRAINT pk_fato_locacao PRIMARY KEY (nk_frota_origem, nk_id_locacao),
     CONSTRAINT fk_fato_locacao_tempo_retirada FOREIGN KEY (sk_tempo_retirada) 
@@ -225,7 +228,7 @@ CREATE TABLE IF NOT EXISTS dw.fato_reserva (
     sk_patio_retirada INT NOT NULL,
     sk_patio_fim INT NOT NULL,
     duracao_prevista_dias INT NOT NULL,
-    valor_previsto_reserva DECIMAL(10,2) DEFAULT 0.00 NOT NULL,
+    valor_previsto_reserva DECIMAL(12,2) DEFAULT 0.00 NOT NULL,
     dd_status_reserva VARCHAR(100) DEFAULT 'ATIVA' NOT NULL,
     qtde_reservas INT DEFAULT 1 NOT NULL,
     CONSTRAINT pk_fato_reserva PRIMARY KEY (nk_frota_origem, nk_id_reserva),

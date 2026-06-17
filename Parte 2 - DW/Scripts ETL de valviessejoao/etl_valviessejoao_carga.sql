@@ -30,13 +30,10 @@ DELIMITER //
 CREATE PROCEDURE dw.sp_garante_dim_tempo(IN p_data DATE)
 BEGIN
     IF p_data IS NOT NULL AND NOT EXISTS (SELECT 1 FROM dw.dim_tempo WHERE data = p_data) THEN
-        INSERT INTO dw.dim_tempo
-            (sk_tempo, data, ano, trimestre, mes, semana_ano, dia_semana, nome_mes, nome_dia)
+        INSERT INTO dw.dim_tempo (sk_tempo, data)
         VALUES (
             CAST(DATE_FORMAT(p_data, '%Y%m%d') AS SIGNED),
-            p_data, YEAR(p_data), QUARTER(p_data), MONTH(p_data),
-            WEEK(p_data, 3), WEEKDAY(p_data) + 1,
-            DATE_FORMAT(p_data, '%M'), DATE_FORMAT(p_data, '%W')
+            p_data
         )
         ON DUPLICATE KEY UPDATE sk_tempo = sk_tempo;
     END IF;

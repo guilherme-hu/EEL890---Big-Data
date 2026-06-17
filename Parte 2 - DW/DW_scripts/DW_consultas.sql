@@ -70,7 +70,7 @@ SELECT
     g.nome_grupo,
     p.nome_patio AS patio_retirada,
     CASE 
-         DATEDIFF(t_ret.data, CURRENT_DATE) <= 7 THEN 'Próxima Semana'
+        WHEN DATEDIFF(t_ret.data, CURRENT_DATE) <= 7 THEN 'Próxima Semana'
         WHEN DATEDIFF(t_ret.data, CURRENT_DATE) <= 30 THEN 'Próximo Mês'
         ELSE 'Longo Prazo' 
     END AS horizonte_retirada,
